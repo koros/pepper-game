@@ -26,24 +26,31 @@ class VisionService:
         self,
         pc_camera_index: int = 0,
         preview_enabled: bool = True,
+        live_preview_enabled: bool = False,
+        live_analysis_interval: float = 2.0,
         save_dir: str = "captured_frames",
         window_name: str = "Pepper Cup Game Vision",
     ) -> None:
         logger.info(
-            "Initializing vision service: pc_camera_index=%s preview_enabled=%s save_dir=%s window_name=%s",
+            "Initializing vision service: pc_camera_index=%s preview_enabled=%s live_preview_enabled=%s live_analysis_interval=%s save_dir=%s window_name=%s",
             pc_camera_index,
             preview_enabled,
+            live_preview_enabled,
+            live_analysis_interval,
             save_dir,
             window_name,
         )
         self.pc_camera_index = pc_camera_index
         self.preview_enabled = preview_enabled
+        self.live_preview_enabled = live_preview_enabled
+        self.live_analysis_interval = live_analysis_interval
         self.save_dir = Path(save_dir)
         self.window_name = window_name
         self.frame_count = 0
         self.last_frame: Optional[np.ndarray] = None
         self.preview_lock = threading.Lock()
         self.preview_running = False
+        self.live_running = False
 
         if self.preview_enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +59,12 @@ class VisionService:
             preview_thread.daemon = True
             preview_thread.start()
             logger.info("Vision preview thread started")
+            if self.live_preview_enabled:
+                self.live_running = True
+                live_thread = threading.Thread(target=self.live_camera_loop, name="vision-live-camera")
+                live_thread.daemon = True
+                live_thread.start()
+                logger.info("Vision live camera thread started")
 
     def decode_bgr(self, width: int, height: int, data: bytes) -> np.ndarray:
         logger.info("Decoding BGR frame: width=%s height=%s bytes=%s", width, height, len(data))
@@ -71,19 +84,23 @@ class VisionService:
             camera.release()
             logger.info("PC camera released")
 
-    def detect_cups(self, frame: np.ndarray) -> Dict[str, object]:
-        logger.info("Running two-row cup detection on frame shape=%s", frame.shape)
+    def detect_cups(self, frame: np.ndarray, source: str = "camera") -> Dict[str, object]:
+        logger.info("Running two-row cup detection on frame shape=%s source=%s", frame.shape, source)
         height = frame.shape[0]
+        width = frame.shape[1]
         split_y = height // 2
         top = self.detect_row(frame[:split_y, :], 0, "top")
         bottom = self.detect_row(frame[split_y:, :], split_y, "bottom")
         all_cups = top["cups"] + bottom["cups"]
         logger.info("Detected top row: %s", top["sequence"])
         logger.info("Detected bottom row: %s", bottom["sequence"])
-        display_frame = self.draw_detections(frame, all_cups, split_y)
+        display_frame = self.draw_detections(frame, all_cups, split_y, source)
         self.show_and_handle_keys(display_frame)
         return {
             "cup_count": len(all_cups),
+            "source": source,
+            "frame_width": width,
+            "frame_height": height,
             "top_row": top["sequence"],
             "bottom_row": bottom["sequence"],
             "sequence": top["sequence"],
@@ -167,6 +184,7 @@ class VisionService:
         frame: np.ndarray,
         cups: List[Dict[str, object]],
         split_y: Optional[int] = None,
+        source: str = "camera",
     ) -> np.ndarray:
         display_frame = frame.copy()
         if split_y is not None:
@@ -187,7 +205,7 @@ class VisionService:
             )
         cv2.putText(
             display_frame,
-            "Press s to save current frame",
+            "%s %sx%s | Press s to save current frame" % (source, frame.shape[1], frame.shape[0]),
             (12, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -230,15 +248,63 @@ class VisionService:
         finally:
             cv2.destroyWindow(self.window_name)
 
+    def live_camera_loop(self) -> None:
+        logger.info("Opening live PC camera preview index %s", self.pc_camera_index)
+        camera = cv2.VideoCapture(self.pc_camera_index)
+        next_analysis_at = 0.0
+        try:
+            while self.live_running and self.preview_enabled:
+                ok, frame = camera.read()
+                if not ok:
+                    logger.warning("Live PC camera preview read failed")
+                    time.sleep(0.5)
+                    continue
+                now = time.time()
+                if now >= next_analysis_at:
+                    self.detect_cups(frame, source="pc-live")
+                    next_analysis_at = now + self.live_analysis_interval
+                else:
+                    self.show_and_handle_keys(self.draw_preview_frame(frame, source="pc-live"))
+                time.sleep(0.2)
+        finally:
+            camera.release()
+            logger.info("Live PC camera preview released")
+
+    def draw_preview_frame(self, frame: np.ndarray, source: str = "camera") -> np.ndarray:
+        display_frame = frame.copy()
+        cv2.line(
+            display_frame,
+            (0, display_frame.shape[0] // 2),
+            (display_frame.shape[1], display_frame.shape[0] // 2),
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            display_frame,
+            "%s %sx%s | Press s to save current frame" % (source, frame.shape[1], frame.shape[0]),
+            (12, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+        )
+        return display_frame
+
     def save_frame(self, frame: np.ndarray) -> None:
         filename = self.save_dir / ("pepper_cup_frame_%s.jpg" % self.frame_count)
         cv2.imwrite(str(filename), frame)
         logger.info("Saved vision frame: %s", filename)
         self.frame_count += 1
 
+    def stop(self) -> None:
+        logger.info("Stopping vision preview")
+        self.live_running = False
+        self.preview_running = False
+        self.preview_enabled = False
+
     def check_pepper_frame(self, width: int, height: int, data: bytes) -> Dict[str, object]:
         logger.info("Checking Pepper camera frame")
-        return self.detect_cups(self.decode_bgr(width, height, data))
+        return self.detect_cups(self.decode_bgr(width, height, data), source="pepper")
 
     def check_pc_camera(self) -> Dict[str, object]:
         logger.info("Checking PC camera frame")
@@ -246,4 +312,4 @@ class VisionService:
         if frame is None:
             logger.warning("Returning zero cups because PC camera is unavailable")
             return {"cup_count": 0, "boxes": [], "error": "PC camera unavailable"}
-        return self.detect_cups(frame)
+        return self.detect_cups(frame, source="pc")

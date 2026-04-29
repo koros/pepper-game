@@ -62,6 +62,11 @@ class CupGameOrchestrator:
         self.vision = VisionService(
             pc_camera_index=int(flags["pc_camera_index"]),
             preview_enabled=bool(flags.get("vision_preview_enabled", True)),
+            live_preview_enabled=(
+                bool(flags.get("vision_live_preview_enabled", False))
+                and str(flags.get("vision_input_mode", "pc")) == "pc"
+            ),
+            live_analysis_interval=float(flags.get("vision_live_analysis_interval", 2.0)),
             save_dir=str(ROOT / str(flags.get("vision_save_dir", "captured_frames"))),
             window_name=str(flags.get("vision_window_name", "Pepper Cup Game Vision")),
         )
@@ -176,17 +181,13 @@ class CupGameOrchestrator:
                 round_state["max_attempts"],
             )
             self.say(round_state["instruction"], event="round_started", data=round_state)
-            self.prompt_for_control()
+            self.prompt_for_control(listen=True)
         elif event == "pc_audio_turn":
             self.handle_pc_audio_turn()
         elif event == "pc_vision_check":
             self.handle_pc_vision_check()
         elif event == "user_guess":
             self.handle_guess(str(message.get("text", "")))
-        elif event == "stop":
-            logger.info("Stop command received")
-            self.say("Stopping the cup game.", event="stopped")
-            self.running = False
         else:
             logger.warning("Unknown command event: %s", event)
             self.send_result("unknown_event", "Unknown command: %s" % event)
@@ -202,7 +203,7 @@ class CupGameOrchestrator:
             self.handle_spoken_input(text)
         else:
             logger.info("Pepper audio utterance had no recognized speech")
-            self.say("I did not catch that. Say ready, check, or hint.")
+            self.say("I did not catch that. Please say the cup colors from left to right, or say help.")
 
     def handle_pc_audio_turn(self) -> None:
         if self.flags["audio_input_mode"] != "pc":
@@ -221,7 +222,7 @@ class CupGameOrchestrator:
             self.handle_spoken_input(text)
         else:
             logger.info("PC microphone capture produced no recognized speech")
-            self.say("I did not catch that from the PC microphone. Say ready, check, or hint.", wait=True)
+            self.say("I did not catch that from the PC microphone.", wait=True)
             self.prompt_for_control(listen=True)
 
     def handle_pc_vision_check(self) -> None:
@@ -273,6 +274,10 @@ class CupGameOrchestrator:
         command = self.game.classify_command(text)
         logger.info("Spoken input classified as %s: %s", command, text)
         if command == "check":
+            if self.is_dev_speech_sequence_mode():
+                self.say("Please say the current top row colors from left to right.", wait=True)
+                self.prompt_for_control(listen=True)
+                return
             self.handle_pc_vision_check() if self.flags["vision_input_mode"] == "pc" else self.send_result(
                 "vision_requested",
                 "Please use the Pepper camera vision box to check the row.",
@@ -287,13 +292,21 @@ class CupGameOrchestrator:
 
     def prompt_for_control(self, listen: bool = False) -> None:
         if self.flags["audio_input_mode"] == "pc" and not self.game.finished:
-            logger.info("Ready for user control word: ready, check, or hint")
+            logger.info("Ready for user control word: ready, check, or help")
+            prompt = (
+                "Please say the current top row colors from left to right. Say help if you need a clue."
+                if self.is_dev_speech_sequence_mode()
+                else "Say ready or check when you want me to evaluate the top row. Say help if you need a clue."
+            )
             self.say(
-                "Say ready or check when you want me to evaluate the top row. Say hint if you need help.",
+                prompt,
                 wait=listen,
             )
             if listen:
                 self.handle_pc_audio_turn()
+
+    def is_dev_speech_sequence_mode(self) -> bool:
+        return bool(self.flags.get("dev_speech_sequence_mode", False))
 
     def say(
         self,
@@ -317,6 +330,9 @@ class CupGameOrchestrator:
             "ready",
             "round_started",
             "say",
+            "guess_checked",
+            "vision_checked",
+            "hint",
             "stopped",
             "mode_ignored",
             "config_error",

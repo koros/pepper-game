@@ -39,8 +39,7 @@ class CupGame:
             "allowed_colors": list(self.allowed_colors),
             "max_attempts": self.max_attempts,
             "instruction": (
-                "Arrange the top row of cups to match the hidden bottom row. "
-                "When you are ready, say ready or check."
+                "Arrange the top row of cups to match the hidden bottom row."
             )
         }
 
@@ -54,7 +53,7 @@ class CupGame:
         lowered = text.lower()
         if re.search(r"\b(ready|check|done|evaluate)\b", lowered):
             return "check"
-        if re.search(r"\b(hint|help|clue)\b", lowered):
+        if re.search(r"\b(help|clue|assist|assistance)\b", lowered):
             return "hint"
         return "sequence"
 

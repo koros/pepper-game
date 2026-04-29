@@ -17,6 +17,9 @@ AUDIO_INPUT_MODE = "pc"   # "pepper" or "pc"
 VISION_INPUT_MODE = "pc"  # "pepper" or "pc"
 SPEECH_OUTPUT_MODE = "pc" # "pepper" or "pc"
 PLAYER_INPUT_MODE = "speech" # "vision" or "speech"
+PEPPER_VISION_STREAM_ENABLED = True
+PEPPER_CAMERA_RESOLUTION = 2  # 1=320x240, 2=640x480
+PEPPER_CAMERA_FPS = 5
 
 
 class MyClass(GeneratedClass):
@@ -31,6 +34,8 @@ class MyClass(GeneratedClass):
         self.tts = None
         self.tts_stop = None
         self.video_subscriber = None
+        self.vision_stream_thread = None
+        self.vision_streaming = False
         self.result_thread = None
         self.bIsRunning = False
         self.speech_ids = []
@@ -46,6 +51,8 @@ class MyClass(GeneratedClass):
         self.logger.info("VISION_INPUT_MODE=" + str(VISION_INPUT_MODE))
         self.logger.info("SPEECH_OUTPUT_MODE=" + str(SPEECH_OUTPUT_MODE))
         self.logger.info("PLAYER_INPUT_MODE=" + str(PLAYER_INPUT_MODE))
+        self.logger.info("PEPPER_CAMERA_RESOLUTION=" + str(PEPPER_CAMERA_RESOLUTION))
+        self.logger.info("PEPPER_CAMERA_FPS=" + str(PEPPER_CAMERA_FPS))
         try:
             self.tts = ALProxy("ALTextToSpeech")
             self.tts_stop = ALProxy("ALTextToSpeech", True)
@@ -75,6 +82,7 @@ class MyClass(GeneratedClass):
         self.logger.info("Cup game entry box unloading.")
         self.bIsRunning = False
         self.restore_head_motion_after_vision()
+        self.stop_pepper_vision_stream()
         self.unsubscribe_audio()
         self.unsubscribe_video()
         self.stop_speech()
@@ -95,6 +103,8 @@ class MyClass(GeneratedClass):
             self.send_command({"event": "hello"})
             self.send_command({"event": "start_round"})
             self.start_result_listener()
+            if VISION_INPUT_MODE == "pepper" and PEPPER_VISION_STREAM_ENABLED:
+                self.start_pepper_vision_stream()
 
             if PLAYER_INPUT_MODE == "vision":
                 if VISION_INPUT_MODE == "pc":
@@ -241,11 +251,10 @@ class MyClass(GeneratedClass):
             self.logger.error("VISION_INPUT_MODE is pepper, but ALVideoDevice is unavailable.")
             return
         camera_index = 0
-        resolution = 1
+        resolution = PEPPER_CAMERA_RESOLUTION
         color_space = 11
-        fps = 10
-        width = 320
-        height = 240
+        fps = PEPPER_CAMERA_FPS
+        width, height = self.camera_dimensions(resolution)
         self.pause_head_motion_for_vision()
         try:
             self.video.setActiveCamera(camera_index)
@@ -259,6 +268,74 @@ class MyClass(GeneratedClass):
             self.send_image(width, height, image[6])
         finally:
             self.restore_head_motion_after_vision()
+
+    def start_pepper_vision_stream(self):
+        if not self.video:
+            self.logger.error("Cannot start Pepper vision stream because ALVideoDevice is unavailable.")
+            return
+        if self.vision_streaming:
+            return
+        self.vision_streaming = True
+        self.vision_stream_thread = threading.Thread(target=self.pepper_vision_stream_loop)
+        self.vision_stream_thread.daemon = True
+        self.vision_stream_thread.start()
+        self.logger.info("Pepper vision stream thread started.")
+
+    def stop_pepper_vision_stream(self):
+        self.vision_streaming = False
+
+    def pepper_vision_stream_loop(self):
+        camera_index = 0
+        resolution = PEPPER_CAMERA_RESOLUTION
+        color_space = 11
+        fps = PEPPER_CAMERA_FPS
+        width, height = self.camera_dimensions(resolution)
+        period = 1.0 / float(max(fps, 1))
+        subscriber = None
+        try:
+            self.video.setActiveCamera(camera_index)
+            subscriber = self.video.subscribeCamera(
+                "cup_game_camera_stream", camera_index, resolution, color_space, fps
+            )
+            self.video_subscriber = subscriber
+            self.logger.info(
+                "Pepper camera stream active resolution=%s width=%s height=%s fps=%s"
+                % (resolution, width, height, fps)
+            )
+            while self.bIsRunning and self.vision_streaming:
+                image = self.video.getImageRemote(subscriber)
+                if image is None:
+                    self.logger.warning("No Pepper camera stream image received.")
+                    time.sleep(period)
+                    continue
+                try:
+                    frame_width = int(image[0]) if image[0] else width
+                    frame_height = int(image[1]) if image[1] else height
+                except Exception:
+                    frame_width = width
+                    frame_height = height
+                self.send_image(frame_width, frame_height, image[6])
+                time.sleep(period)
+        except Exception as e:
+            self.logger.error("Pepper vision stream failed: " + str(e))
+        finally:
+            if self.video and subscriber:
+                try:
+                    self.video.unsubscribe(subscriber)
+                    self.logger.info("Pepper camera stream unsubscribed.")
+                except Exception:
+                    pass
+            if self.video_subscriber == subscriber:
+                self.video_subscriber = None
+
+    def camera_dimensions(self, resolution):
+        if resolution == 2:
+            return 640, 480
+        if resolution == 1:
+            return 320, 240
+        if resolution == 0:
+            return 160, 120
+        return 320, 240
 
     def pause_head_motion_for_vision(self):
         if not self.basic_awareness or self.vision_motion_paused:
