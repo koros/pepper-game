@@ -156,15 +156,22 @@ class CupGame:
 
         last = self.history[-1]
         player_sequence = list(last.get("player_sequence", []))
-        for index, (player, target) in enumerate(zip(player_sequence, self.target_sequence), start=1):
-            if player == target:
-                return {
-                    "status": "hint",
-                    "reply": "Hint. Position %s is correct." % index,
-                    "attempt": self.attempt_number,
-                    "position": index,
-                    "color": player,
-                }
+        correct_positions = [
+            index
+            for index, (player, target) in enumerate(zip(player_sequence, self.target_sequence), start=1)
+            if player == target
+        ]
+        if correct_positions:
+            positions = ", ".join(str(position) for position in correct_positions)
+            return {
+                "status": "hint",
+                "reply": "Hint. Position%s %s correct." % (
+                    "" if len(correct_positions) == 1 else "s",
+                    positions + (" is" if len(correct_positions) == 1 else " are"),
+                ),
+                "attempt": self.attempt_number,
+                "positions": correct_positions,
+            }
 
         if player_sequence:
             return {

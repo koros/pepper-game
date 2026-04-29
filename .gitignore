@@ -1,0 +1,45 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local package installs
+.venv/
+venv/
+env/
+.env/
+ENV/
+Lib/
+Scripts/
+site-packages/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs and runtime output
+*.log
+logs/
+*.tmp
+*.temp
+
+# Generated captures and media artifacts
+captured_frames/
+*.wav
+*.mp3
+*.mp4
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini

@@ -1,7 +1,7 @@
 {
-  "audio_input_mode": "pc",
-  "vision_input_mode": "pc",
-  "speech_output_mode": "pc",
+  "audio_input_mode": "pepper",
+  "vision_input_mode": "pepper",
+  "speech_output_mode": "pepper",
   "player_input_mode": "speech",
   "dev_speech_sequence_mode": true,
   "target_sequence": ["red", "blue", "orange", "yellow"],
