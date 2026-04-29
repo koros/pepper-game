@@ -9,6 +9,7 @@ PC_IP = "127.0.0.1"
 COMMAND_PORT = 50010
 AUDIO_PORT = 50011
 AUDIO_INPUT_MODE = "pc"  # "pepper" or "pc"
+AUDIO_SUBSCRIBER_NAME = "Audio_2"
 
 
 class MyClass(GeneratedClass):
@@ -22,6 +23,7 @@ class MyClass(GeneratedClass):
     def onLoad(self):
         self.bIsRunning = False
         self.logger.info("Audio stream box loaded with AUDIO_INPUT_MODE=" + str(AUDIO_INPUT_MODE))
+        self.logger.info("AUDIO_SUBSCRIBER_NAME=" + str(AUDIO_SUBSCRIBER_NAME))
         try:
             self.audio = ALProxy("ALAudioDevice")
             self.logger.info("ALAudioDevice proxy ready.")
@@ -34,7 +36,7 @@ class MyClass(GeneratedClass):
         self.bIsRunning = False
         try:
             if self.audio:
-                self.audio.unsubscribe(self.getName())
+                self.audio.unsubscribe(self.audio_subscriber_name())
         except Exception:
             pass
         self.close_socket(self.command_socket)
@@ -66,9 +68,16 @@ class MyClass(GeneratedClass):
         self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.logger.info("Connecting audio socket to " + str(PC_IP) + ":" + str(AUDIO_PORT))
         self.audio_socket.connect((PC_IP, AUDIO_PORT))
-        self.audio.setClientPreferences(self.getName(), 16000, 3, 0)
-        self.audio.subscribe(self.getName())
-        self.logger.info("Pepper microphone subscribed and streaming.")
+        subscriber_name = self.audio_subscriber_name()
+        self.audio.setClientPreferences(subscriber_name, 16000, 3, 0)
+        self.audio.subscribe(subscriber_name)
+        self.logger.info(
+            "Pepper microphone subscribed and streaming with subscriber name=%s."
+            % subscriber_name
+        )
+
+    def audio_subscriber_name(self):
+        return str(AUDIO_SUBSCRIBER_NAME)
 
     def processRemote(self, nbOfChannels, nbrOfSamplesByChannel, timestamp, buffer):
         if not self.bIsRunning or AUDIO_INPUT_MODE != "pepper":

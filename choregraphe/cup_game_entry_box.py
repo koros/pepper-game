@@ -20,7 +20,8 @@ PLAYER_INPUT_MODE = "speech"  # "vision" or "speech"
 PEPPER_VISION_STREAM_ENABLED = True
 PEPPER_CAMERA_RESOLUTION = 2  # 1=320x240, 2=640x480
 PEPPER_CAMERA_FPS = 5
-PEPPER_AUDIO_STREAM_ENABLED = False
+PEPPER_AUDIO_STREAM_ENABLED = True
+AUDIO_SUBSCRIBER_NAME = "Game_3"
 PEPPER_HEAD_YAW = 0.0
 PEPPER_HEAD_PITCH = 0.25
 
@@ -68,6 +69,7 @@ class MyClass(GeneratedClass):
         self.logger.info("PEPPER_CAMERA_RESOLUTION=" + str(PEPPER_CAMERA_RESOLUTION))
         self.logger.info("PEPPER_CAMERA_FPS=" + str(PEPPER_CAMERA_FPS))
         self.logger.info("PEPPER_AUDIO_STREAM_ENABLED=" + str(PEPPER_AUDIO_STREAM_ENABLED))
+        self.logger.info("AUDIO_SUBSCRIBER_NAME=" + str(AUDIO_SUBSCRIBER_NAME))
         self.logger.info("PEPPER_HEAD_YAW=" + str(PEPPER_HEAD_YAW))
         self.logger.info("PEPPER_HEAD_PITCH=" + str(PEPPER_HEAD_PITCH))
 
@@ -150,6 +152,7 @@ class MyClass(GeneratedClass):
 
                 elif VISION_INPUT_MODE == "pepper":
                     self.logger.info("Vision handled by Pepper camera by manual flag.")
+                    self.send_command({"event": "pepper_vision_check"})
                     self.capture_and_send_pepper_frame()
 
                 else:
@@ -315,11 +318,16 @@ class MyClass(GeneratedClass):
             self.logger.error("AUDIO_INPUT_MODE is pepper, but ALAudioDevice is unavailable.")
             return False
 
+        subscriber_name = self.audio_subscriber_name()
+
         try:
-            self.audio.setClientPreferences(self.getName(), 16000, 3, 0)
-            self.audio.subscribe(self.getName())
+            self.audio.setClientPreferences(subscriber_name, 16000, 3, 0)
+            self.audio.subscribe(subscriber_name)
             self.audio_subscribed = True
-            self.logger.info("Pepper microphone streaming started.")
+            self.logger.info(
+                "Pepper microphone streaming started with subscriber name=%s."
+                % subscriber_name
+            )
             return True
         except Exception as e:
             self.audio_subscribed = False
@@ -330,12 +338,19 @@ class MyClass(GeneratedClass):
 
     def unsubscribe_audio(self):
         if self.audio and self.audio_subscribed:
+            subscriber_name = self.audio_subscriber_name()
             try:
-                self.audio.unsubscribe(self.getName())
-                self.logger.info("Pepper microphone unsubscribed.")
+                self.audio.unsubscribe(subscriber_name)
+                self.logger.info(
+                    "Pepper microphone unsubscribed from subscriber name=%s."
+                    % subscriber_name
+                )
             except Exception as e:
                 self.logger.warning("Pepper microphone unsubscribe failed: " + str(e))
             self.audio_subscribed = False
+
+    def audio_subscriber_name(self):
+        return str(AUDIO_SUBSCRIBER_NAME)
 
     def capture_and_send_pepper_frame(self):
         if not self.video:

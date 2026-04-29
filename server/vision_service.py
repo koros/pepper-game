@@ -67,7 +67,7 @@ class VisionService:
                 logger.info("Vision live camera thread started")
 
     def decode_bgr(self, width: int, height: int, data: bytes) -> np.ndarray:
-        logger.info("Decoding BGR frame: width=%s height=%s bytes=%s", width, height, len(data))
+        logger.debug("Decoding BGR frame: width=%s height=%s bytes=%s", width, height, len(data))
         return np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
 
     def capture_pc_frame(self) -> Optional[np.ndarray]:
@@ -194,25 +194,56 @@ class VisionService:
             color = str(cup["color"])
             row = str(cup.get("row", "row"))
             cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(
+            self.draw_text_overlay(
                 display_frame,
                 "%s %s %s" % (row, index, color),
                 (x, max(20, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 255, 0),
-                2,
+                thickness=2,
             )
-        cv2.putText(
+        self.draw_text_overlay(
             display_frame,
             "%s %sx%s | Press s to save current frame" % (source, frame.shape[1], frame.shape[0]),
             (12, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (255, 255, 255),
-            2,
+            thickness=2,
         )
         return display_frame
+
+    def draw_text_overlay(
+        self,
+        frame: np.ndarray,
+        text: str,
+        origin: tuple,
+        font_face: int,
+        font_scale: float,
+        text_color: tuple,
+        thickness: int = 2,
+        padding: int = 6,
+        background_color: tuple = (0, 0, 0),
+        background_alpha: float = 0.72,
+    ) -> None:
+        x, y = origin
+        text_size, baseline = cv2.getTextSize(text, font_face, font_scale, thickness)
+        text_width, text_height = text_size
+
+        left = max(0, x - padding)
+        top = max(0, y - text_height - padding)
+        right = min(frame.shape[1], x + text_width + padding)
+        bottom = min(frame.shape[0], y + baseline + padding)
+
+        if right > left and bottom > top:
+            roi = frame[top:bottom, left:right]
+            backing = np.full(roi.shape, background_color, dtype=np.uint8)
+            cv2.addWeighted(backing, background_alpha, roi, 1.0 - background_alpha, 0, roi)
+
+        shadow_origin = (min(frame.shape[1] - 1, x + 1), min(frame.shape[0] - 1, y + 1))
+        cv2.putText(frame, text, shadow_origin, font_face, font_scale, (0, 0, 0), thickness + 1)
+        cv2.putText(frame, text, origin, font_face, font_scale, text_color, thickness)
 
     def show_and_handle_keys(self, frame: np.ndarray) -> None:
         with self.preview_lock:
@@ -222,14 +253,14 @@ class VisionService:
         logger.info("Creating vision preview window: %s", self.window_name)
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
-        cv2.putText(
+        self.draw_text_overlay(
             placeholder,
             "Waiting for camera frame",
             (36, 184),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (255, 255, 255),
-            2,
+            thickness=2,
         )
         try:
             while self.preview_running:
@@ -279,14 +310,14 @@ class VisionService:
             (255, 255, 255),
             1,
         )
-        cv2.putText(
+        self.draw_text_overlay(
             display_frame,
             "%s %sx%s | Press s to save current frame" % (source, frame.shape[1], frame.shape[0]),
             (12, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (255, 255, 255),
-            2,
+            thickness=2,
         )
         return display_frame
 
@@ -305,6 +336,10 @@ class VisionService:
     def check_pepper_frame(self, width: int, height: int, data: bytes) -> Dict[str, object]:
         logger.info("Checking Pepper camera frame")
         return self.detect_cups(self.decode_bgr(width, height, data), source="pepper")
+
+    def preview_pepper_frame(self, width: int, height: int, data: bytes) -> None:
+        frame = self.decode_bgr(width, height, data)
+        self.show_and_handle_keys(self.draw_preview_frame(frame, source="pepper-preview"))
 
     def check_pc_camera(self) -> Dict[str, object]:
         logger.info("Checking PC camera frame")

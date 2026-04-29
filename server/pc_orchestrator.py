@@ -34,6 +34,9 @@ class CupGameOrchestrator:
         self.command_conn = None
         self.result_conn = None
         self.result_lock = threading.Lock()
+        self.pepper_vision_check_requested = False
+        self.pepper_vision_check_lock = threading.Lock()
+        self.last_pepper_preview_log_at = 0.0
         self.awaiting_control = False
 
         logger.info("Initializing cup game orchestrator")
@@ -139,21 +142,25 @@ class CupGameOrchestrator:
         logger.info("Vision socket listening on port %s", self.ports["vision_port"])
         while self.running:
             conn, addr = server.accept()
-            logger.info("Vision client connected from %s:%s", *addr)
+            logger.debug("Vision client connected from %s:%s", *addr)
             with conn:
                 frame = recv_image(conn)
                 if frame is None:
                     logger.warning("Vision client disconnected before sending a full frame")
                     continue
                 width, height, data = frame
-                logger.info(
-                    "Received Pepper vision frame: width=%s height=%s bytes=%s",
-                    width,
-                    height,
-                    len(data),
-                )
-                result = self.vision.check_pepper_frame(width, height, data)
-                self.handle_vision_result(result)
+                if self.consume_pepper_vision_check_request():
+                    logger.info(
+                        "Received Pepper vision check frame: width=%s height=%s bytes=%s",
+                        width,
+                        height,
+                        len(data),
+                    )
+                    result = self.vision.check_pepper_frame(width, height, data)
+                    self.handle_vision_result(result)
+                else:
+                    self.log_pepper_preview_frame(width, height, len(data))
+                    self.vision.preview_pepper_frame(width, height, data)
 
     def result_loop(self) -> None:
         server = listen(self.host, self.ports["result_port"])
@@ -186,6 +193,9 @@ class CupGameOrchestrator:
             self.handle_pc_audio_turn()
         elif event == "pc_vision_check":
             self.handle_pc_vision_check()
+        elif event == "pepper_vision_check":
+            self.request_pepper_vision_check()
+            self.send_result("vision_requested", "Checking the Pepper camera frame.")
         elif event == "user_guess":
             self.handle_guess(str(message.get("text", "")))
         else:
@@ -278,10 +288,13 @@ class CupGameOrchestrator:
                 self.say("Please say the current top row colors from left to right.", wait=True)
                 self.prompt_for_control(listen=True)
                 return
-            self.handle_pc_vision_check() if self.flags["vision_input_mode"] == "pc" else self.send_result(
-                "vision_requested",
-                "Please use the Pepper camera vision box to check the row.",
-            )
+            if self.flags["vision_input_mode"] == "pc":
+                self.handle_pc_vision_check()
+            elif self.flags["vision_input_mode"] == "pepper":
+                self.request_pepper_vision_check()
+                self.send_result("vision_requested", "Checking the Pepper camera frame.")
+            else:
+                self.send_result("config_error", "Invalid vision_input_mode.")
         elif command == "hint":
             outcome = self.game.hint()
             logger.info("Hint outcome: %s", outcome)
@@ -307,6 +320,30 @@ class CupGameOrchestrator:
 
     def is_dev_speech_sequence_mode(self) -> bool:
         return bool(self.flags.get("dev_speech_sequence_mode", False))
+
+    def request_pepper_vision_check(self) -> None:
+        with self.pepper_vision_check_lock:
+            self.pepper_vision_check_requested = True
+        logger.info("Pepper vision check armed; next Pepper frame will be evaluated")
+
+    def consume_pepper_vision_check_request(self) -> bool:
+        with self.pepper_vision_check_lock:
+            if not self.pepper_vision_check_requested:
+                return False
+            self.pepper_vision_check_requested = False
+            return True
+
+    def log_pepper_preview_frame(self, width: int, height: int, byte_count: int) -> None:
+        now = time.time()
+        if now - self.last_pepper_preview_log_at < 5.0:
+            return
+        self.last_pepper_preview_log_at = now
+        logger.info(
+            "Receiving Pepper vision preview frames: latest width=%s height=%s bytes=%s",
+            width,
+            height,
+            byte_count,
+        )
 
     def say(
         self,
