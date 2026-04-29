@@ -1,0 +1,22 @@
+{
+  "audio_input_mode": "pc",
+  "vision_input_mode": "pc",
+  "speech_output_mode": "pc",
+  "player_input_mode": "speech",
+  "target_sequence": ["red", "blue", "orange", "yellow"],
+  "allowed_colors": ["red", "blue", "orange", "yellow", "green", "purple"],
+  "max_attempts": 8,
+  "pc_camera_index": 0,
+  "vision_preview_enabled": true,
+  "vision_save_dir": "captured_frames",
+  "vision_window_name": "Pepper Cup Game Vision",
+  "pc_speech_enabled": true,
+  "pc_speech_rate": 0,
+  "pc_speech_volume": 100,
+  "lm_studio_base_url": "http://localhost:1234/v1",
+  "lm_studio_model": "bartowski/llama-3.2-1b-instruct",
+  "whisper_model": "base.en",
+  "energy_vad_threshold": 550,
+  "energy_vad_min_speech_frames": 3,
+  "energy_vad_end_silence_frames": 18
+}

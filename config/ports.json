@@ -1,0 +1,6 @@
+{
+  "command_port": 50010,
+  "audio_port": 50011,
+  "vision_port": 50012,
+  "result_port": 50013
+}

@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import os
+import logging
+import re
+import tempfile
+import wave
+from typing import Optional
+
+import numpy as np
+import sounddevice as sd
+from faster_whisper import WhisperModel
+
+
+SAMPLE_RATE = 16000
+SAMPLE_WIDTH = 2
+CHANNELS = 1
+FRAME_MS = 30
+FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * SAMPLE_WIDTH
+logger = logging.getLogger("audio")
+
+
+class EnergyVad:
+    def __init__(self, threshold: float) -> None:
+        self.threshold = threshold
+        logger.info("Energy VAD initialized with threshold=%s", threshold)
+
+    def is_speech(self, frame: bytes) -> bool:
+        if not frame:
+            return False
+        samples = np.frombuffer(frame, dtype=np.int16)
+        if samples.size == 0:
+            return False
+        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        return rms >= self.threshold
+
+
+class AudioService:
+    def __init__(self, whisper_model: str, vad_threshold: float) -> None:
+        logger.info(
+            "Initializing audio service: whisper_model=%s energy_vad_threshold=%s",
+            whisper_model,
+            vad_threshold,
+        )
+        self.vad = EnergyVad(vad_threshold)
+        logger.info("Loading faster-whisper model. This can take a moment on first run.")
+        self.whisper = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+        logger.info("Audio service ready")
+
+    def has_speech(self, pcm: bytes) -> bool:
+        logger.info("Running VAD over %s bytes of PCM audio", len(pcm))
+        speech_frames = 0
+        total_frames = 0
+        for start in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES):
+            frame = pcm[start : start + FRAME_BYTES]
+            total_frames += 1
+            if self.vad.is_speech(frame):
+                speech_frames += 1
+        has_speech = total_frames > 0 and speech_frames >= 3
+        logger.info(
+            "VAD summary: total_frames=%s speech_frames=%s has_speech=%s",
+            total_frames,
+            speech_frames,
+            has_speech,
+        )
+        return has_speech
+
+    def write_wav(self, pcm: bytes) -> str:
+        temp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        temp.close()
+        with wave.open(temp.name, "wb") as wav:
+            wav.setnchannels(CHANNELS)
+            wav.setsampwidth(SAMPLE_WIDTH)
+            wav.setframerate(SAMPLE_RATE)
+            wav.writeframes(pcm)
+        logger.info("Temporary WAV written for transcription: %s", temp.name)
+        return temp.name
+
+    def transcribe_pcm(self, pcm: bytes) -> str:
+        if not self.has_speech(pcm):
+            logger.info("Skipping transcription because VAD found no speech")
+            return ""
+        wav_path = self.write_wav(pcm)
+        try:
+            logger.info("Starting faster-whisper transcription")
+            segments, _info = self.whisper.transcribe(wav_path, beam_size=5)
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            if text and not re.search(r"[A-Za-z0-9]", text):
+                logger.info("Discarding punctuation-only transcription: %s", text)
+                text = ""
+            logger.info("Transcription complete: %s", text or "[empty]")
+            return text
+        finally:
+            try:
+                os.remove(wav_path)
+                logger.info("Removed temporary WAV: %s", wav_path)
+            except OSError:
+                logger.warning("Could not remove temporary WAV: %s", wav_path)
+                pass
+
+    def capture_pc_mic(self, seconds: float = 4.0) -> bytes:
+        logger.info("Capturing PC microphone audio for %.1f seconds", seconds)
+        frames = int(seconds * SAMPLE_RATE)
+        audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1, dtype="int16")
+        sd.wait()
+        logger.info("PC microphone capture complete: %s bytes", audio.nbytes)
+        return audio.tobytes()
+
+    def capture_and_transcribe_pc_mic(self, seconds: float = 4.0) -> str:
+        return self.transcribe_pcm(self.capture_pc_mic(seconds))
+
+
+class UtteranceBuffer:
+    def __init__(
+        self,
+        vad_threshold: float,
+        min_speech_frames: int,
+        end_silence_frames: int,
+    ) -> None:
+        logger.info(
+            "Initializing utterance buffer with threshold=%s min_speech_frames=%s end_silence_frames=%s",
+            vad_threshold,
+            min_speech_frames,
+            end_silence_frames,
+        )
+        self.vad = EnergyVad(vad_threshold)
+        self.min_speech_frames = min_speech_frames
+        self.end_silence_frames = end_silence_frames
+        self.active = False
+        self.speech_frames = 0
+        self.silence_frames = 0
+        self.pending = bytearray()
+        self.utterance = bytearray()
+
+    def consume(self, data: bytes) -> Optional[bytes]:
+        self.pending.extend(data)
+        completed = None
+
+        while len(self.pending) >= FRAME_BYTES:
+            frame = bytes(self.pending[:FRAME_BYTES])
+            del self.pending[:FRAME_BYTES]
+            is_speech = self.vad.is_speech(frame)
+
+            if is_speech:
+                self.speech_frames += 1
+                self.silence_frames = 0
+            else:
+                self.silence_frames += 1
+
+            if not self.active and self.speech_frames >= self.min_speech_frames:
+                self.active = True
+                self.utterance = bytearray()
+                logger.info("Speech start detected in Pepper audio stream")
+
+            if self.active:
+                self.utterance.extend(frame)
+
+            if self.active and self.silence_frames >= self.end_silence_frames:
+                completed = bytes(self.utterance)
+                logger.info("Speech end detected in Pepper audio stream: %s bytes", len(completed))
+                self.active = False
+                self.speech_frames = 0
+                self.silence_frames = 0
+                self.utterance = bytearray()
+                break
+
+            if not self.active and not is_speech:
+                self.speech_frames = 0
+
+        return completed
