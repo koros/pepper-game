@@ -12,9 +12,9 @@ VISION_PORT = 50012
 RESULT_PORT = 50013
 
 # Manual user flags. Change these before running the Choregraphe behavior.
-AUDIO_INPUT_MODE = "pepper"   # "pepper" or "pc"
-VISION_INPUT_MODE = "pepper"  # "pepper" or "pc"
-SPEECH_OUTPUT_MODE = "pepper" # "pepper" or "pc"
+AUDIO_INPUT_MODE = "pc"   # "pepper" or "pc"
+VISION_INPUT_MODE = "pc"  # "pepper" or "pc"
+SPEECH_OUTPUT_MODE = "pc" # "pepper" or "pc"
 PLAYER_INPUT_MODE = "speech"  # "vision" or "speech"
 
 PEPPER_VISION_STREAM_ENABLED = True
@@ -132,59 +132,83 @@ class MyClass(GeneratedClass):
         self.logger.info("Cup game entry starting.")
 
         try:
-            self.connect_command_socket()
-            self.connect_result_socket()
-
-            self.logger.info("Sending hello and start_round commands.")
-            self.send_command({"event": "hello"})
-            self.send_command({"event": "start_round"})
-
-            self.start_result_listener()
-
-            if VISION_INPUT_MODE == "pepper" and PEPPER_VISION_STREAM_ENABLED:
-                self.start_pepper_vision_stream()
-
-            if PLAYER_INPUT_MODE == "vision":
-                if VISION_INPUT_MODE == "pc":
-                    self.logger.info("Vision delegated to PC by manual flag.")
-                    self.pause_head_motion_for_vision()
-                    self.send_command({"event": "pc_vision_check"})
-
-                elif VISION_INPUT_MODE == "pepper":
-                    self.logger.info("Vision handled by Pepper camera by manual flag.")
-                    self.send_command({"event": "pepper_vision_check"})
-                    self.capture_and_send_pepper_frame()
-
-                else:
-                    self.logger.error("Invalid VISION_INPUT_MODE: " + str(VISION_INPUT_MODE))
-
-            elif PLAYER_INPUT_MODE == "speech":
-                if AUDIO_INPUT_MODE == "pc":
-                    self.logger.info("Audio delegated to PC by manual flag.")
-                    self.send_command({"event": "pc_audio_turn"})
-
-                elif AUDIO_INPUT_MODE == "pepper":
-                    self.logger.info("Audio handled by Pepper microphone by manual flag.")
-                    if not PEPPER_AUDIO_STREAM_ENABLED:
-                        self.logger.warning(
-                            "Pepper microphone streaming is disabled; game stays open for vision preview and PC results."
-                        )
-                    elif self.subscribe_audio():
-                        self.connect_audio_socket()
-                    else:
-                        self.logger.warning(
-                            "Pepper microphone input is unavailable; game stays open for vision preview and PC results."
-                        )
-
-                else:
-                    self.logger.error("Invalid AUDIO_INPUT_MODE: " + str(AUDIO_INPUT_MODE))
-
-            else:
-                self.logger.error("Invalid PLAYER_INPUT_MODE: " + str(PLAYER_INPUT_MODE))
+            self.connect_control_channels()
+            self.start_server_round()
+            self.start_background_streams()
+            self.start_player_input_mode()
 
         except Exception as e:
             self.logger.error("Cup game entry failed: " + str(e))
             self.onInput_onStop()
+
+    def connect_control_channels(self):
+        self.connect_command_socket()
+        self.connect_result_socket()
+        self.start_result_listener()
+
+    def start_server_round(self):
+        self.logger.info("Sending hello and start_round commands.")
+        self.send_command({"event": "hello"})
+        self.send_command({"event": "start_round"})
+
+    def start_background_streams(self):
+        # Keep Pepper's camera feed available for preview/debug even when speech drives the game.
+        if VISION_INPUT_MODE == "pepper" and PEPPER_VISION_STREAM_ENABLED:
+            self.start_pepper_vision_stream()
+
+    def start_player_input_mode(self):
+        # PLAYER_INPUT_MODE chooses the game input surface. Vision can still preview in the background.
+        if PLAYER_INPUT_MODE == "vision":
+            self.start_vision_input()
+        elif PLAYER_INPUT_MODE == "speech":
+            self.start_speech_input()
+        else:
+            self.logger.error("Invalid PLAYER_INPUT_MODE: " + str(PLAYER_INPUT_MODE))
+
+    def start_vision_input(self):
+        if VISION_INPUT_MODE == "pc":
+            self.request_pc_vision_check()
+        elif VISION_INPUT_MODE == "pepper":
+            self.request_pepper_vision_check()
+        else:
+            self.logger.error("Invalid VISION_INPUT_MODE: " + str(VISION_INPUT_MODE))
+
+    def request_pc_vision_check(self):
+        self.logger.info("Vision delegated to PC by manual flag.")
+        self.pause_head_motion_for_vision()
+        self.send_command({"event": "pc_vision_check"})
+
+    def request_pepper_vision_check(self):
+        self.logger.info("Vision handled by Pepper camera by manual flag.")
+        self.send_command({"event": "pepper_vision_check"})
+        self.capture_and_send_pepper_frame()
+
+    def start_speech_input(self):
+        if AUDIO_INPUT_MODE == "pc":
+            self.request_pc_audio_turn()
+        elif AUDIO_INPUT_MODE == "pepper":
+            self.start_pepper_audio_stream()
+        else:
+            self.logger.error("Invalid AUDIO_INPUT_MODE: " + str(AUDIO_INPUT_MODE))
+
+    def request_pc_audio_turn(self):
+        self.logger.info("Audio delegated to PC by manual flag.")
+        self.send_command({"event": "pc_audio_turn"})
+
+    def start_pepper_audio_stream(self):
+        self.logger.info("Audio handled by Pepper microphone by manual flag.")
+        if not PEPPER_AUDIO_STREAM_ENABLED:
+            self.logger.warning(
+                "Pepper microphone streaming is disabled; game stays open for vision preview and PC results."
+            )
+            return
+
+        if self.subscribe_audio():
+            self.connect_audio_socket()
+        else:
+            self.logger.warning(
+                "Pepper microphone input is unavailable; game stays open for vision preview and PC results."
+            )
 
     def connect_command_socket(self):
         self.logger.info("Connecting command socket to " + str(PC_IP) + ":" + str(COMMAND_PORT))
