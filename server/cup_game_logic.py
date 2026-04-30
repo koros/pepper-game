@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ logger = logging.getLogger("cup_game")
 class CupGame:
     target_sequence: List[str] = field(default_factory=lambda: list(DEFAULT_TARGET))
     allowed_colors: List[str] = field(default_factory=lambda: list(DEFAULT_COLORS))
-    max_attempts: int = 8
+    max_attempts: int = 15
     attempt_number: int = 0
     finished: bool = False
     history: List[Dict[str, object]] = field(default_factory=list)
@@ -39,9 +40,26 @@ class CupGame:
             "allowed_colors": list(self.allowed_colors),
             "max_attempts": self.max_attempts,
             "instruction": (
-                "Arrange the top row of cups to match the hidden bottom row."
+                "Welcome to the Pepper cup sequence game. "
+                "There is a hidden row of colored cups, and your goal is to arrange the top row "
+                "so the colors match that hidden order. "
+                "After each guess, I will only tell you how many cups are correct. "
+                "Say ready or check when you want me to evaluate your row, and say help if you want a hint."
             )
         }
+
+    def shuffle_target_sequence(self) -> List[str]:
+        original = list(self.target_sequence)
+        shuffled = list(self.target_sequence)
+        for _ in range(5):
+            random.shuffle(shuffled)
+            if shuffled != original:
+                break
+        if shuffled == original and len(shuffled) > 1:
+            shuffled = shuffled[1:] + shuffled[:1]
+        self.target_sequence = shuffled
+        logger.info("Target sequence shuffled: %s", self.target_sequence)
+        return list(self.target_sequence)
 
     def set_target_sequence(self, target_sequence: List[str]) -> None:
         normalized = [color.lower() for color in target_sequence]
@@ -129,6 +147,8 @@ class CupGame:
             ) % (exact_matches, ", ".join(target))
         else:
             reply = "You got %s correct." % exact_matches
+            if attempts_left == 5:
+                reply += " Careful, you have 5 guesses left."
 
         outcome = {
             "status": status,

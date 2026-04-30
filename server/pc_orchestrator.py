@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ class CupGameOrchestrator:
         self.pepper_vision_check_lock = threading.Lock()
         self.last_pepper_preview_log_at = 0.0
         self.awaiting_control = False
+        self.awaiting_replay_response = False
 
         logger.info("Initializing cup game orchestrator")
         logger.info("Host bind address: %s", host)
@@ -51,7 +53,7 @@ class CupGameOrchestrator:
             allowed_colors=self.load_string_list(
                 flags.get("allowed_colors", ["red", "blue", "orange", "yellow", "green", "purple"])
             ),
-            max_attempts=int(flags.get("max_attempts", 8)),
+            max_attempts=int(flags.get("max_attempts", 15)),
         )
         self.audio = AudioService(
             whisper_model=str(flags["whisper_model"]),
@@ -181,14 +183,7 @@ class CupGameOrchestrator:
         if event == "hello":
             self.send_result("ready", "PC cup game server is ready.")
         elif event == "start_round":
-            round_state = self.game.start_round()
-            logger.info(
-                "Started sequence game: target_length=%s max_attempts=%s",
-                round_state["target_length"],
-                round_state["max_attempts"],
-            )
-            self.say(round_state["instruction"], event="round_started", data=round_state)
-            self.prompt_for_control(listen=True)
+            self.start_round()
         elif event == "pc_audio_turn":
             self.handle_pc_audio_turn()
         elif event == "pc_vision_check":
@@ -233,7 +228,10 @@ class CupGameOrchestrator:
         else:
             logger.info("PC microphone capture produced no recognized speech")
             self.say("I did not catch that from the PC microphone.", wait=True)
-            self.prompt_for_control(listen=True)
+            if self.awaiting_replay_response:
+                self.prompt_for_replay(listen=True)
+            else:
+                self.prompt_for_control(listen=True)
 
     def handle_pc_vision_check(self) -> None:
         if self.flags["vision_input_mode"] != "pc":
@@ -271,6 +269,8 @@ class CupGameOrchestrator:
         self.say(str(outcome["reply"]), event="vision_checked", data=outcome)
         if not bool(outcome.get("finished", False)):
             self.prompt_for_control(listen=True)
+        else:
+            self.prompt_for_replay(listen=True)
 
     def handle_guess(self, text: str) -> None:
         logger.info("Checking user guess text: %s", text)
@@ -279,8 +279,14 @@ class CupGameOrchestrator:
         self.say(outcome["reply"], event="guess_checked", data=outcome)
         if not bool(outcome.get("finished", False)):
             self.prompt_for_control(listen=True)
+        else:
+            self.prompt_for_replay(listen=True)
 
     def handle_spoken_input(self, text: str) -> None:
+        if self.awaiting_replay_response:
+            self.handle_replay_response(text)
+            return
+
         command = self.game.classify_command(text)
         logger.info("Spoken input classified as %s: %s", command, text)
         if command == "check":
@@ -302,6 +308,42 @@ class CupGameOrchestrator:
             self.prompt_for_control(listen=True)
         else:
             self.handle_guess(text)
+
+    def start_round(self, shuffle_target: bool = False) -> None:
+        self.awaiting_replay_response = False
+        if shuffle_target:
+            self.game.shuffle_target_sequence()
+        round_state = self.game.start_round()
+        logger.info(
+            "Started sequence game: target_length=%s max_attempts=%s",
+            round_state["target_length"],
+            round_state["max_attempts"],
+        )
+        self.say(round_state["instruction"], event="round_started", data=round_state)
+        self.prompt_for_control(listen=True)
+
+    def prompt_for_replay(self, listen: bool = False) -> None:
+        self.awaiting_replay_response = True
+        self.say("Do you want to play again? Say yes or no.", event="play_again_prompt", wait=listen)
+        if listen and self.flags["audio_input_mode"] == "pc":
+            self.handle_pc_audio_turn()
+
+    def handle_replay_response(self, text: str) -> None:
+        lowered = text.lower()
+        if re.search(r"\b(yes|yeah|yep|sure|again|play again|restart)\b", lowered):
+            logger.info("Replay accepted by user: %s", text)
+            self.say("Great. I shuffled the hidden row. Starting a new game.", event="play_again", wait=True)
+            self.start_round(shuffle_target=True)
+            return
+        if re.search(r"\b(no|nope|stop|not now|quit)\b", lowered):
+            logger.info("Replay declined by user: %s", text)
+            self.awaiting_replay_response = False
+            self.say("Okay. The game is finished.", event="play_again")
+            return
+        logger.info("Replay response unclear: %s", text)
+        self.say("Please say yes to play again, or no to finish.", event="play_again_prompt", wait=True)
+        if self.flags["audio_input_mode"] == "pc":
+            self.handle_pc_audio_turn()
 
     def prompt_for_control(self, listen: bool = False) -> None:
         if self.flags["audio_input_mode"] == "pc" and not self.game.finished:
@@ -370,6 +412,8 @@ class CupGameOrchestrator:
             "guess_checked",
             "vision_checked",
             "hint",
+            "play_again",
+            "play_again_prompt",
             "stopped",
             "mode_ignored",
             "config_error",
