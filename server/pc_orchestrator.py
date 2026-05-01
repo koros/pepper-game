@@ -262,12 +262,14 @@ class CupGameOrchestrator:
                 self.flags["audio_input_mode"],
             )
         logger.warning("Starting PC microphone capture turn")
+        listening_message = "Beginning to listen now. Please speak clearly into the PC microphone."
         if self.pc_audio_barge_in_enabled:
             # Start recording immediately so a user can answer while the prompt is still playing.
-            self.send_result("pc_audio_started", "Listening from the PC microphone.")
+            self.send_result("pc_audio_started", listening_message)
         else:
             self.speech.wait_for_idle()
-            self.say("Listening from the PC microphone.", event="pc_audio_started", wait=True)
+            self.say(listening_message, event="pc_audio_started", wait=True)
+        logger.warning("PC microphone is listening now")
         text = self.audio.capture_and_transcribe_pc_mic(
             capture_seconds or self.pc_mic_capture_seconds,
             on_speech_start=self.stop_pc_prompt_for_barge_in if self.pc_audio_barge_in_enabled else None,

@@ -201,6 +201,7 @@ class AudioService:
             "Listening with callback microphone stream for up to %.1f seconds",
             max_seconds,
         )
+        logger.warning("PC microphone will log every transcript candidate it hears")
         block_frames = int(SAMPLE_RATE * block_seconds)
         deadline = time.monotonic() + max_seconds
         audio_buffer = []
