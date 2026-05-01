@@ -339,6 +339,10 @@ class MyClass(GeneratedClass):
 
                 text = str(message.get("text", ""))
                 event = str(message.get("event", ""))
+                data = message.get("data", {})
+                if not isinstance(data, dict):
+                    data = {}
+                speech_token = str(data.get("speech_token", ""))
 
                 self.logger.info("Received result event=%s text=%s" % (event, text))
 
@@ -346,14 +350,14 @@ class MyClass(GeneratedClass):
                     self.restore_head_motion_after_vision()
 
                 if text:
-                    self.handle_speech(event, text)
+                    self.handle_speech(event, text, speech_token)
 
             except Exception as e:
                 self.logger.error("Result listener stopped: " + str(e))
                 self.restore_head_motion_after_vision()
                 return
 
-    def handle_speech(self, event, text):
+    def handle_speech(self, event, text, speech_token=""):
         self.logger.info("PC result: " + text)
 
         if SPEECH_OUTPUT_MODE != "pepper":
@@ -361,7 +365,7 @@ class MyClass(GeneratedClass):
             return
 
         if not self.tts:
-            self.notify_speech_done(event, text)
+            self.notify_speech_done(event, text, speech_token)
             return
 
         audio_was_subscribed = self.audio_subscribed
@@ -383,11 +387,18 @@ class MyClass(GeneratedClass):
         if self.is_pepper_audio_active() and self.bIsRunning and audio_was_subscribed:
             self.subscribe_audio()
 
-        self.notify_speech_done(event, text)
+        self.notify_speech_done(event, text, speech_token)
 
-    def notify_speech_done(self, event, text):
+    def notify_speech_done(self, event, text, speech_token=""):
         try:
-            self.send_command({"event": "speech_done", "speech_event": event, "text": text})
+            self.send_command(
+                {
+                    "event": "speech_done",
+                    "speech_event": event,
+                    "speech_token": speech_token,
+                    "text": text,
+                }
+            )
         except Exception as e:
             self.logger.warning("Could not notify PC that Pepper speech finished: " + str(e))
 

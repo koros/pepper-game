@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 try:
     import msvcrt
@@ -61,8 +61,9 @@ class CupGameOrchestrator:
         self.rearrange_pause_seconds = float(flags.get("rearrange_pause_seconds", 8.0))
         self.pc_audio_fallback_active = False
         self.keyboard_lock = threading.RLock()
-        self.pepper_speech_done = threading.Event()
-        self.pepper_speech_done.set()
+        self.pepper_speech_condition = threading.Condition()
+        self.next_pepper_speech_token = 0
+        self.completed_pepper_speech_tokens: Set[str] = set()
         self.pepper_speech_timeout_seconds = float(flags.get("pepper_speech_done_timeout_seconds", 20.0))
         self.pomdp = PepperPOMDP()
         self.pomdp_hint_policy_enabled = bool(flags.get("pomdp_hint_policy_enabled", True))
@@ -276,8 +277,17 @@ class CupGameOrchestrator:
             self.send_result("unknown_event", "Unknown command: %s" % event)
 
     def handle_pepper_speech_done(self, message: Dict[str, object]) -> None:
-        logger.warning("Pepper speech completed: event=%s text=%s", message.get("speech_event", ""), message.get("text", ""))
-        self.pepper_speech_done.set()
+        token = str(message.get("speech_token", "")).strip()
+        logger.warning(
+            "Pepper speech completed: event=%s token=%s text=%s",
+            message.get("speech_event", ""),
+            token or "[missing]",
+            message.get("text", ""),
+        )
+        with self.pepper_speech_condition:
+            if token:
+                self.completed_pepper_speech_tokens.add(token)
+            self.pepper_speech_condition.notify_all()
 
     def handle_audio_utterance(self, pcm: bytes) -> None:
         if self.pc_audio_fallback_active:
@@ -305,8 +315,11 @@ class CupGameOrchestrator:
         logger.warning("Starting PC microphone capture turn")
         listening_message = "Beginning to listen now. Please speak clearly into the PC microphone."
         if self.flags["speech_output_mode"] == "pepper":
-            self.say(listening_message, event="pc_audio_started", wait=False)
-            self.wait_for_pepper_speech_before_pc_input("pc_audio_started")
+            # In Pepper-output/PC-input mode, do not make Pepper say an extra
+            # listening prompt here. The previous prompt has already told the
+            # user what to do, and another TTS round often causes the PC mic to
+            # miss a quick answer.
+            self.send_result("pc_audio_started", "")
         elif self.pc_audio_barge_in_enabled:
             # Start recording immediately so a user can answer while the prompt is still playing.
             self.send_result("pc_audio_started", listening_message)
@@ -708,9 +721,9 @@ class CupGameOrchestrator:
         if self.pc_audio_barge_in_enabled and self.speech.is_busy():
             logger.info("Waiting for active PC speech before listening prompt: %s", message)
             self.speech.wait_for_idle()
-        self.say(message, event=event, wait=(listen and not self.pc_audio_barge_in_enabled))
+        speech_token = self.say(message, event=event, wait=(listen and not self.pc_audio_barge_in_enabled))
         if listen:
-            self.wait_for_pepper_speech_before_pc_input(event)
+            self.wait_for_pepper_speech_before_pc_input(event, speech_token)
 
     def stop_pc_prompt_for_barge_in(self) -> bool:
         if self.speech.is_busy():
@@ -725,23 +738,41 @@ class CupGameOrchestrator:
             and (self.uses_pc_audio_input() or self.uses_pc_keyboard_input())
         )
 
-    def arm_pepper_speech_wait(self, event: str, text: str) -> None:
+    def arm_pepper_speech_wait(self, event: str, text: str) -> Optional[str]:
         if self.flags["speech_output_mode"] != "pepper" or not text:
-            return
-        logger.info("Arming Pepper speech completion wait: event=%s", event)
-        self.pepper_speech_done.clear()
+            return None
+        with self.pepper_speech_condition:
+            self.next_pepper_speech_token += 1
+            token = "%s-%s-%s" % (int(time.time() * 1000), self.next_pepper_speech_token, event)
+        logger.warning("Arming Pepper speech completion wait: event=%s token=%s", event, token)
+        return token
 
-    def wait_for_pepper_speech_before_pc_input(self, event: str) -> None:
+    def wait_for_pepper_speech_before_pc_input(self, event: str, speech_token: Optional[str]) -> None:
         if not self.should_wait_for_pepper_speech_before_pc_input():
             return
-        logger.warning("Waiting for Pepper speech to finish before PC input: event=%s", event)
-        if self.pepper_speech_done.wait(self.pepper_speech_timeout_seconds):
-            logger.warning("Pepper speech finished; PC input may start")
-        else:
-            logger.warning(
-                "Timed out waiting %.1f seconds for Pepper speech completion; starting PC input anyway",
-                self.pepper_speech_timeout_seconds,
-            )
+        if not speech_token:
+            logger.warning("No Pepper speech token for event=%s; starting PC input without speech wait", event)
+            return
+
+        logger.warning("Waiting for Pepper speech to finish before PC input: event=%s token=%s", event, speech_token)
+        deadline = time.monotonic() + self.pepper_speech_timeout_seconds
+        with self.pepper_speech_condition:
+            while speech_token not in self.completed_pepper_speech_tokens:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.pepper_speech_condition.wait(remaining)
+
+            if speech_token in self.completed_pepper_speech_tokens:
+                self.completed_pepper_speech_tokens.discard(speech_token)
+                logger.warning("Pepper speech finished; PC input may start: token=%s", speech_token)
+                return
+
+        logger.warning(
+            "Timed out waiting %.1f seconds for Pepper speech completion; starting PC input anyway: token=%s",
+            self.pepper_speech_timeout_seconds,
+            speech_token,
+        )
 
     def uses_vision_sequence_input(self) -> bool:
         return str(self.flags.get("player_input_mode", "")).lower() == "vision"
@@ -821,16 +852,20 @@ class CupGameOrchestrator:
         event: str = "say",
         data: Optional[Dict[str, object]] = None,
         wait: bool = False,
-    ) -> None:
+    ) -> Optional[str]:
         logger.info("Preparing Pepper speech event=%s message=%s", event, message)
         polished = message if self.should_use_literal_speech(event) else self.llm.polish_for_pepper(message)
         if polished != message:
             logger.info("LM Studio polished message: %s", polished)
-        self.arm_pepper_speech_wait(event, polished)
+        speech_token = self.arm_pepper_speech_wait(event, polished)
+        payload_data = dict(data or {})
+        if speech_token:
+            payload_data["speech_token"] = speech_token
         if self.flags["speech_output_mode"] == "pc":
             logger.info("[PC SPEECH] %s", polished)
             self.speech.say(polished, wait=wait)
-        self.send_result(event, polished, data)
+        self.send_result(event, polished, payload_data)
+        return speech_token
 
     def should_use_literal_speech(self, event: str) -> bool:
         return event in {
