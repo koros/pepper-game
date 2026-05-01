@@ -1,6 +1,6 @@
 {
   "audio_input_mode": "pc",
-  "vision_input_mode": "pc",
+  "vision_input_mode": "pepper",
   "speech_output_mode": "pc",
   "player_input_mode": "vision",
   "dev_speech_sequence_mode": false,
