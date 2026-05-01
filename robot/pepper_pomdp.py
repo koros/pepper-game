@@ -1,4 +1,9 @@
+import logging
+
 import numpy as np
+
+
+logger = logging.getLogger("pomdp")
 
 # ---------------------------------
 # POMDP Model START
@@ -72,7 +77,7 @@ class PepperPOMDP:
         new_belief = likelihood * predicted_belief  # P(o|s',a) * P(s'|a)
 
         self.belief = new_belief / np.sum(new_belief)  # Normalize the belief
-        print("Updated belief:", self.belief)
+        logger.warning("Updated belief: %s", self.belief)
         
         return self.belief
     

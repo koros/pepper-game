@@ -21,6 +21,14 @@ from sockets import listen, local_ip, recv_blob, recv_image, recv_json_line, sen
 from speech_service import SpeechService
 from vision_service import VisionService
 
+import sys
+
+ROBOT_DIR = Path(__file__).resolve().parents[1] / "robot"
+if str(ROBOT_DIR) not in sys.path:
+    sys.path.append(str(ROBOT_DIR))
+
+from pepper_pomdp import PepperPOMDP
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
@@ -53,6 +61,17 @@ class CupGameOrchestrator:
         self.rearrange_pause_seconds = float(flags.get("rearrange_pause_seconds", 8.0))
         self.pc_audio_fallback_active = False
         self.keyboard_lock = threading.RLock()
+        self.pepper_speech_done = threading.Event()
+        self.pepper_speech_done.set()
+        self.pepper_speech_timeout_seconds = float(flags.get("pepper_speech_done_timeout_seconds", 20.0))
+        self.pomdp = PepperPOMDP()
+        self.pomdp_hint_policy_enabled = bool(flags.get("pomdp_hint_policy_enabled", True))
+        self.pomdp_fast_move_seconds = float(flags.get("pomdp_fast_move_seconds", 10.0))
+        self.pomdp_min_attempts_before_offer = int(flags.get("pomdp_min_attempts_before_offer", 2))
+        self.pomdp_offer_cooldown_attempts = int(flags.get("pomdp_offer_cooldown_attempts", 2))
+        self.last_control_prompt_at = time.monotonic()
+        self.last_hint_offer_attempt = 0
+        self.hint_offer_pending = False
 
         logger.info("Initializing cup game orchestrator")
         logger.info("Host bind address: %s", host)
@@ -227,6 +246,15 @@ class CupGameOrchestrator:
     def handle_command(self, message: Dict[str, object]) -> None:
         event = str(message.get("event", ""))
         logger.info("Command received: event=%s payload=%s", event, message)
+        if event == "speech_done":
+            self.handle_pepper_speech_done(message)
+            return
+        thread = threading.Thread(target=self.handle_command_event, args=(message,), name="command-%s" % event)
+        thread.daemon = True
+        thread.start()
+
+    def handle_command_event(self, message: Dict[str, object]) -> None:
+        event = str(message.get("event", ""))
         if event == "hello":
             self.send_result("ready", "PC cup game server is ready.")
         elif event == "start_round":
@@ -246,6 +274,10 @@ class CupGameOrchestrator:
         else:
             logger.warning("Unknown command event: %s", event)
             self.send_result("unknown_event", "Unknown command: %s" % event)
+
+    def handle_pepper_speech_done(self, message: Dict[str, object]) -> None:
+        logger.warning("Pepper speech completed: event=%s text=%s", message.get("speech_event", ""), message.get("text", ""))
+        self.pepper_speech_done.set()
 
     def handle_audio_utterance(self, pcm: bytes) -> None:
         if self.pc_audio_fallback_active:
@@ -272,7 +304,10 @@ class CupGameOrchestrator:
             )
         logger.warning("Starting PC microphone capture turn")
         listening_message = "Beginning to listen now. Please speak clearly into the PC microphone."
-        if self.pc_audio_barge_in_enabled:
+        if self.flags["speech_output_mode"] == "pepper":
+            self.say(listening_message, event="pc_audio_started", wait=False)
+            self.wait_for_pepper_speech_before_pc_input("pc_audio_started")
+        elif self.pc_audio_barge_in_enabled:
             # Start recording immediately so a user can answer while the prompt is still playing.
             self.send_result("pc_audio_started", listening_message)
         else:
@@ -340,7 +375,7 @@ class CupGameOrchestrator:
         logger.info("Vision sequence outcome: %s", outcome)
         self.say(str(outcome["reply"]), event="vision_checked", data=outcome)
         if not bool(outcome.get("finished", False)):
-            self.prompt_for_control(listen=True, pause_before_listen=True)
+            self.prompt_after_attempt(outcome)
         else:
             self.prompt_for_replay(listen=True)
 
@@ -350,7 +385,7 @@ class CupGameOrchestrator:
         logger.info("Guess outcome: %s", outcome)
         self.say(outcome["reply"], event="guess_checked", data=outcome)
         if not bool(outcome.get("finished", False)):
-            self.prompt_for_control(listen=True, pause_before_listen=True)
+            self.prompt_after_attempt(outcome)
         else:
             self.prompt_for_replay(listen=True)
 
@@ -362,6 +397,7 @@ class CupGameOrchestrator:
         command = self.game.classify_command(text)
         logger.warning("Spoken input classified as %s: %s", command, text)
         if command == "check":
+            self.record_hint_offer_response(accepted=False)
             self.say("Okay, checking now.", wait=False)
             if self.is_dev_speech_sequence_mode():
                 self.say("Please say the current top row colors from left to right.", wait=False)
@@ -375,6 +411,7 @@ class CupGameOrchestrator:
             else:
                 self.send_result("config_error", "Invalid vision_input_mode.")
         elif command == "hint":
+            self.record_hint_offer_response(accepted=True)
             outcome = self.game.hint()
             logger.info("Hint outcome: %s", outcome)
             self.say(str(outcome["reply"]), event="hint", data=outcome)
@@ -396,6 +433,10 @@ class CupGameOrchestrator:
         announce_rules: bool = True,
     ) -> None:
         self.awaiting_replay_response = False
+        self.pomdp = PepperPOMDP()
+        self.hint_offer_pending = False
+        self.last_hint_offer_attempt = 0
+        self.last_control_prompt_at = time.monotonic()
         if require_vision_target_shuffle:
             self.previous_vision_target = list(self.game.target_sequence)
             self.awaiting_vision_target_shuffle = True
@@ -414,6 +455,61 @@ class CupGameOrchestrator:
         message = round_state["instruction"] if announce_rules else "New game started."
         self.say(message, event="round_started", data=round_state)
         self.prompt_for_control(listen=True)
+
+    def prompt_after_attempt(self, outcome: Dict[str, object]) -> None:
+        if self.should_offer_pomdp_hint(outcome):
+            self.hint_offer_pending = True
+            self.last_hint_offer_attempt = int(outcome.get("attempt", self.game.attempt_number))
+            self.say(
+                "Would you like a hint? Press H for help, or C to keep trying.",
+                event="hint_offer",
+                data={
+                    "pomdp_belief": list(self.pomdp.belief),
+                    "attempt": int(outcome.get("attempt", self.game.attempt_number)),
+                },
+            )
+            self.prompt_for_control(listen=True, pause_before_listen=True)
+            return
+        self.prompt_for_control(listen=True, pause_before_listen=True)
+
+    def should_offer_pomdp_hint(self, outcome: Dict[str, object]) -> bool:
+        if not self.pomdp_hint_policy_enabled:
+            return False
+        if bool(outcome.get("finished", False)):
+            return False
+        attempt = int(outcome.get("attempt", self.game.attempt_number))
+        if attempt < self.pomdp_min_attempts_before_offer:
+            return False
+        if self.hint_offer_pending:
+            return False
+        if attempt - self.last_hint_offer_attempt < self.pomdp_offer_cooldown_attempts:
+            return False
+
+        move_seconds = max(time.monotonic() - self.last_control_prompt_at, 0.0)
+        observation = 0 if move_seconds < self.pomdp_fast_move_seconds else 1
+        self.pomdp.update_belief("act_wait", observation)
+        action, values = self.pomdp.select_action()
+        logger.warning(
+            "POMDP hint policy: move_seconds=%.1f observation=%s belief=%s values=%s action=%s",
+            move_seconds,
+            "fast" if observation == 0 else "slow",
+            self.pomdp.belief,
+            values,
+            action,
+        )
+        return action == "act_offerHint"
+
+    def record_hint_offer_response(self, accepted: bool) -> None:
+        if not self.hint_offer_pending:
+            return
+        observation = 0 if accepted else 1
+        self.pomdp.update_belief("act_offerHint", observation)
+        logger.warning(
+            "POMDP hint offer %s: belief=%s",
+            "accepted" if accepted else "rejected",
+            self.pomdp.belief,
+        )
+        self.hint_offer_pending = False
 
     def prompt_for_replay(self, listen: bool = False, prefix: str = "") -> None:
         self.awaiting_replay_response = True
@@ -458,6 +554,7 @@ class CupGameOrchestrator:
         if (self.uses_pc_audio_input() or self.uses_pc_keyboard_input()) and not self.game.finished:
             logger.info("Ready for user control: c=check h=help")
             prompt = self.control_prompt_text(pause_before_listen=pause_before_listen)
+            self.last_control_prompt_at = time.monotonic()
             self.say_listening_prompt("%s%s" % (prefix, prompt), listen=listen)
             if listen:
                 if self.uses_pc_keyboard_input():
@@ -491,9 +588,16 @@ class CupGameOrchestrator:
         return str(self.flags.get("audio_input_mode", "")).lower() == "pc" or self.pc_audio_fallback_active
 
     def uses_pc_keyboard_input(self) -> bool:
-        return str(self.flags.get("pc_control_input_mode", "speech")).lower() == "keyboard"
+        return str(self.flags.get("pc_control_input_mode", "speech")).lower() in ("keyboard", "hybrid")
+
+    def uses_pc_hybrid_input(self) -> bool:
+        return str(self.flags.get("pc_control_input_mode", "speech")).lower() == "hybrid"
 
     def handle_pc_keyboard_turn(self) -> None:
+        if self.uses_pc_hybrid_input() and not self.is_dev_speech_sequence_mode():
+            self.handle_pc_hybrid_turn()
+            return
+
         with self.keyboard_lock:
             if self.awaiting_replay_response:
                 logger.warning("Waiting for keyboard replay input: y=yes n=no")
@@ -523,6 +627,63 @@ class CupGameOrchestrator:
                 logger.warning("Ignored keyboard input for control: %s", key)
                 self.prompt_for_control(listen=True, prefix="I did not understand that key. ")
 
+    def handle_pc_hybrid_turn(self) -> None:
+        with self.keyboard_lock:
+            if self.awaiting_replay_response:
+                logger.warning("Listening for replay response; keyboard override: y=yes n=no")
+                text = self.audio.listen_with_streaming_whisper(
+                    self.pc_mic_capture_seconds,
+                    on_speech_start=self.stop_pc_prompt_for_barge_in if self.pc_audio_barge_in_enabled else None,
+                    accept_transcript=self.is_replay_transcript,
+                    poll_key=self.poll_replay_key,
+                )
+                if text:
+                    logger.warning("Hybrid replay input accepted: %s", text)
+                    self.handle_replay_response(text)
+                else:
+                    self.prompt_for_replay(listen=True, prefix="I did not catch that. ")
+                return
+
+            logger.warning("Listening for control command; keyboard override: c=check h=help")
+            text = self.audio.listen_with_streaming_whisper(
+                self.pc_mic_capture_seconds,
+                on_speech_start=self.stop_pc_prompt_for_barge_in if self.pc_audio_barge_in_enabled else None,
+                accept_transcript=self.is_control_transcript,
+                poll_key=self.poll_control_key,
+            )
+            if text:
+                logger.warning("Hybrid control input accepted: %s", text)
+                self.handle_spoken_input(text)
+            else:
+                self.prompt_for_control(listen=True, prefix="I did not hear check or help. ")
+
+    def is_control_transcript(self, text: str) -> bool:
+        return self.game.classify_command(text) in ("check", "hint")
+
+    def is_replay_transcript(self, text: str) -> bool:
+        lowered = text.lower()
+        return bool(re.search(r"\b(yes|yeah|yep|sure|again|play again|restart|no|nope|stop|not now|quit)\b", lowered))
+
+    def poll_control_key(self) -> Optional[str]:
+        key = self.poll_pc_key()
+        if key == "c":
+            return "check"
+        if key == "h":
+            return "help"
+        if key:
+            logger.warning("Ignored keyboard input while listening for control: %s", key)
+        return None
+
+    def poll_replay_key(self) -> Optional[str]:
+        key = self.poll_pc_key()
+        if key == "y":
+            return "yes"
+        if key == "n":
+            return "no"
+        if key:
+            logger.warning("Ignored keyboard input while listening for replay: %s", key)
+        return None
+
     def read_pc_key(self, prompt: str) -> str:
         print(prompt, end="", flush=True)
         if msvcrt is not None:
@@ -530,6 +691,13 @@ class CupGameOrchestrator:
             print(key)
             return key.lower()
         return input().strip().lower()[:1]
+
+    def poll_pc_key(self) -> Optional[str]:
+        if msvcrt is None or not msvcrt.kbhit():
+            return None
+        key = msvcrt.getwch()
+        print(key)
+        return key.lower()
 
     def should_speak_listening_prompt(self) -> bool:
         return not (self.pc_audio_barge_in_enabled and self.speech.is_busy())
@@ -541,6 +709,8 @@ class CupGameOrchestrator:
             logger.info("Waiting for active PC speech before listening prompt: %s", message)
             self.speech.wait_for_idle()
         self.say(message, event=event, wait=(listen and not self.pc_audio_barge_in_enabled))
+        if listen:
+            self.wait_for_pepper_speech_before_pc_input(event)
 
     def stop_pc_prompt_for_barge_in(self) -> bool:
         if self.speech.is_busy():
@@ -548,6 +718,30 @@ class CupGameOrchestrator:
             self.speech.stop_all()
             return True
         return False
+
+    def should_wait_for_pepper_speech_before_pc_input(self) -> bool:
+        return (
+            self.flags["speech_output_mode"] == "pepper"
+            and (self.uses_pc_audio_input() or self.uses_pc_keyboard_input())
+        )
+
+    def arm_pepper_speech_wait(self, event: str, text: str) -> None:
+        if self.flags["speech_output_mode"] != "pepper" or not text:
+            return
+        logger.info("Arming Pepper speech completion wait: event=%s", event)
+        self.pepper_speech_done.clear()
+
+    def wait_for_pepper_speech_before_pc_input(self, event: str) -> None:
+        if not self.should_wait_for_pepper_speech_before_pc_input():
+            return
+        logger.warning("Waiting for Pepper speech to finish before PC input: event=%s", event)
+        if self.pepper_speech_done.wait(self.pepper_speech_timeout_seconds):
+            logger.warning("Pepper speech finished; PC input may start")
+        else:
+            logger.warning(
+                "Timed out waiting %.1f seconds for Pepper speech completion; starting PC input anyway",
+                self.pepper_speech_timeout_seconds,
+            )
 
     def uses_vision_sequence_input(self) -> bool:
         return str(self.flags.get("player_input_mode", "")).lower() == "vision"
@@ -632,6 +826,7 @@ class CupGameOrchestrator:
         polished = message if self.should_use_literal_speech(event) else self.llm.polish_for_pepper(message)
         if polished != message:
             logger.info("LM Studio polished message: %s", polished)
+        self.arm_pepper_speech_wait(event, polished)
         if self.flags["speech_output_mode"] == "pc":
             logger.info("[PC SPEECH] %s", polished)
             self.speech.say(polished, wait=wait)
@@ -646,6 +841,7 @@ class CupGameOrchestrator:
             "guess_checked",
             "vision_checked",
             "hint",
+            "hint_offer",
             "play_again",
             "play_again_prompt",
             "stopped",

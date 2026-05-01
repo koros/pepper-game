@@ -194,6 +194,8 @@ class AudioService:
         self,
         max_seconds: float = 30.0,
         on_speech_start: Optional[Callable[[], bool]] = None,
+        accept_transcript: Optional[Callable[[str], bool]] = None,
+        poll_key: Optional[Callable[[], Optional[str]]] = None,
         block_seconds: float = 0.5,
         blocks_per_transcription: int = 6,
     ) -> str:
@@ -221,6 +223,12 @@ class AudioService:
             callback=audio_callback,
         ):
             while time.monotonic() < deadline:
+                if poll_key:
+                    key_text = poll_key()
+                    if key_text:
+                        logger.warning("PC keyboard override received while listening: %s", key_text)
+                        return key_text
+
                 if len(audio_buffer) < blocks_per_transcription:
                     time.sleep(0.05)
                     continue
@@ -243,7 +251,9 @@ class AudioService:
                 logger.warning("PC mic transcript candidate: %s rms=%.4f", text or "[empty]", rms)
 
                 if text and len(text) > 2 and re.search(r"[A-Za-z0-9]", text):
-                    return text
+                    if accept_transcript is None or accept_transcript(text):
+                        return text
+                    logger.warning("PC mic transcript logged but not accepted as current input: %s", text)
 
         logger.warning("PC microphone listener timed out without recognized speech")
         return ""

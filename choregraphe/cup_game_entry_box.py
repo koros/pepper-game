@@ -18,8 +18,8 @@ RESULT_PORT = 50013
 
 # Manual user flags. Change these before running the Choregraphe behavior.
 AUDIO_INPUT_MODE = "pc"       # "pepper" or "pc"
-VISION_INPUT_MODE = "pepper"  # "pepper" or "pc"
-SPEECH_OUTPUT_MODE = "pepper" # "pepper" or "pc"
+VISION_INPUT_MODE = "pc"      # "pepper" or "pc"
+SPEECH_OUTPUT_MODE = "pc"     # "pepper" or "pc"
 PLAYER_INPUT_MODE = "vision"  # "vision" or "speech"
 
 PEPPER_VISION_STREAM_ENABLED = True
@@ -346,14 +346,14 @@ class MyClass(GeneratedClass):
                     self.restore_head_motion_after_vision()
 
                 if text:
-                    self.handle_speech(text)
+                    self.handle_speech(event, text)
 
             except Exception as e:
                 self.logger.error("Result listener stopped: " + str(e))
                 self.restore_head_motion_after_vision()
                 return
 
-    def handle_speech(self, text):
+    def handle_speech(self, event, text):
         self.logger.info("PC result: " + text)
 
         if SPEECH_OUTPUT_MODE != "pepper":
@@ -361,6 +361,7 @@ class MyClass(GeneratedClass):
             return
 
         if not self.tts:
+            self.notify_speech_done(event, text)
             return
 
         audio_was_subscribed = self.audio_subscribed
@@ -381,6 +382,14 @@ class MyClass(GeneratedClass):
 
         if self.is_pepper_audio_active() and self.bIsRunning and audio_was_subscribed:
             self.subscribe_audio()
+
+        self.notify_speech_done(event, text)
+
+    def notify_speech_done(self, event, text):
+        try:
+            self.send_command({"event": "speech_done", "speech_event": event, "text": text})
+        except Exception as e:
+            self.logger.warning("Could not notify PC that Pepper speech finished: " + str(e))
 
     def subscribe_audio(self):
         if not self.audio:
