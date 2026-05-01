@@ -24,6 +24,7 @@ LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
 logger = logging.getLogger("orchestrator")
+vision_logger = logging.getLogger("vision")
 
 
 class CupGameOrchestrator:
@@ -40,11 +41,17 @@ class CupGameOrchestrator:
         self.last_pepper_preview_log_at = 0.0
         self.awaiting_control = False
         self.awaiting_replay_response = False
+        self.awaiting_vision_target_shuffle = False
+        self.previous_vision_target: Optional[List[str]] = None
+        self.pc_mic_capture_seconds = float(flags.get("pc_mic_capture_seconds", 7.0))
+        self.pc_audio_barge_in_enabled = bool(flags.get("pc_audio_barge_in_enabled", True))
+        self.rearrange_pause_seconds = float(flags.get("rearrange_pause_seconds", 8.0))
 
         logger.info("Initializing cup game orchestrator")
         logger.info("Host bind address: %s", host)
         logger.info("Socket ports: %s", ports)
         logger.info("Runtime flags: %s", flags)
+        self.configure_logger_levels()
 
         self.game = CupGame(
             target_sequence=self.load_string_list(
@@ -58,6 +65,8 @@ class CupGameOrchestrator:
         self.audio = AudioService(
             whisper_model=str(flags["whisper_model"]),
             vad_threshold=float(flags["energy_vad_threshold"]),
+            min_speech_frames=int(flags["energy_vad_min_speech_frames"]),
+            end_silence_frames=int(flags["energy_vad_end_silence_frames"]),
         )
         self.audio_buffer = UtteranceBuffer(
             vad_threshold=float(flags["energy_vad_threshold"]),
@@ -84,6 +93,13 @@ class CupGameOrchestrator:
             rate=int(flags.get("pc_speech_rate", 0)),
             volume=int(flags.get("pc_speech_volume", 100)),
         )
+
+    def configure_logger_levels(self) -> None:
+        if bool(self.flags.get("vision_logging_enabled", True)):
+            vision_logger.setLevel(logging.INFO)
+        else:
+            vision_logger.setLevel(logging.WARNING)
+            logger.info("Vision info logging disabled; warnings and errors will still be shown")
 
     def start(self) -> None:
         logger.info("PC IP for Pepper: %s", local_ip())
@@ -210,7 +226,7 @@ class CupGameOrchestrator:
             logger.info("Pepper audio utterance had no recognized speech")
             self.say("I did not catch that. Please say the cup colors from left to right, or say help.")
 
-    def handle_pc_audio_turn(self) -> None:
+    def handle_pc_audio_turn(self, capture_seconds: Optional[float] = None) -> None:
         if self.flags["audio_input_mode"] != "pc":
             logger.warning("PC audio requested while audio_input_mode=%s", self.flags["audio_input_mode"])
             self.send_result(
@@ -219,19 +235,26 @@ class CupGameOrchestrator:
             )
             return
         logger.info("Starting PC microphone capture turn")
-        self.speech.wait_for_idle()
-        self.say("Listening from the PC microphone.", event="pc_audio_started", wait=True)
-        text = self.audio.capture_and_transcribe_pc_mic()
+        if self.pc_audio_barge_in_enabled:
+            # Start recording immediately so a user can answer while the prompt is still playing.
+            self.send_result("pc_audio_started", "Listening from the PC microphone.")
+        else:
+            self.speech.wait_for_idle()
+            self.say("Listening from the PC microphone.", event="pc_audio_started", wait=True)
+        text = self.audio.capture_and_transcribe_pc_mic(
+            capture_seconds or self.pc_mic_capture_seconds,
+            on_speech_start=self.stop_pc_prompt_for_barge_in if self.pc_audio_barge_in_enabled else None,
+        )
         if text:
             logger.info("Transcribed PC microphone as: %s", text)
+            self.speech.stop_all()
             self.handle_spoken_input(text)
         else:
             logger.info("PC microphone capture produced no recognized speech")
-            self.say("I did not catch that from the PC microphone.", wait=True)
             if self.awaiting_replay_response:
-                self.prompt_for_replay(listen=True)
+                self.prompt_for_replay(listen=True, prefix="I did not catch that. ")
             else:
-                self.prompt_for_control(listen=True)
+                self.prompt_for_control(listen=True, prefix="I did not catch that. ")
 
     def handle_pc_vision_check(self) -> None:
         if self.flags["vision_input_mode"] != "pc":
@@ -253,10 +276,21 @@ class CupGameOrchestrator:
         top_row = result.get("top_row", result.get("sequence", []))
         bottom_row = result.get("bottom_row", [])
         logger.info("Vision result: top_row=%s bottom_row=%s raw=%s", top_row, bottom_row, result)
-        if isinstance(bottom_row, list) and bottom_row:
-            self.game.set_target_sequence([str(color) for color in bottom_row])
-        if isinstance(top_row, list) and top_row:
-            outcome = self.game.evaluate_sequence([str(color) for color in top_row])
+
+        normalized_bottom = self.normalize_color_sequence(bottom_row)
+        normalized_top = self.normalize_color_sequence(top_row)
+
+        if self.awaiting_vision_target_shuffle:
+            shuffle_outcome = self.validate_vision_target_shuffle(normalized_bottom, result)
+            if shuffle_outcome:
+                self.say(str(shuffle_outcome["reply"]), event="vision_checked", data=shuffle_outcome)
+                self.prompt_for_control(listen=True)
+                return
+
+        if normalized_bottom:
+            self.game.set_target_sequence(normalized_bottom)
+        if normalized_top:
+            outcome = self.game.evaluate_sequence(normalized_top)
             outcome["top_row"] = top_row
             outcome["bottom_row_detected"] = bottom_row
         else:
@@ -268,7 +302,7 @@ class CupGameOrchestrator:
         logger.info("Vision sequence outcome: %s", outcome)
         self.say(str(outcome["reply"]), event="vision_checked", data=outcome)
         if not bool(outcome.get("finished", False)):
-            self.prompt_for_control(listen=True)
+            self.prompt_for_control(listen=True, pause_before_listen=True)
         else:
             self.prompt_for_replay(listen=True)
 
@@ -278,7 +312,7 @@ class CupGameOrchestrator:
         logger.info("Guess outcome: %s", outcome)
         self.say(outcome["reply"], event="guess_checked", data=outcome)
         if not bool(outcome.get("finished", False)):
-            self.prompt_for_control(listen=True)
+            self.prompt_for_control(listen=True, pause_before_listen=True)
         else:
             self.prompt_for_replay(listen=True)
 
@@ -290,8 +324,9 @@ class CupGameOrchestrator:
         command = self.game.classify_command(text)
         logger.info("Spoken input classified as %s: %s", command, text)
         if command == "check":
+            self.say("Okay, checking now.", wait=False)
             if self.is_dev_speech_sequence_mode():
-                self.say("Please say the current top row colors from left to right.", wait=True)
+                self.say("Please say the current top row colors from left to right.", wait=False)
                 self.prompt_for_control(listen=True)
                 return
             if self.flags["vision_input_mode"] == "pc":
@@ -305,12 +340,31 @@ class CupGameOrchestrator:
             outcome = self.game.hint()
             logger.info("Hint outcome: %s", outcome)
             self.say(str(outcome["reply"]), event="hint", data=outcome)
-            self.prompt_for_control(listen=True)
+            self.prompt_for_control(listen=True, pause_before_listen=True)
         else:
+            if self.uses_vision_sequence_input() and not self.is_dev_speech_sequence_mode():
+                logger.info("Ignoring non-control spoken input while vision mode is active: %s", text)
+                self.prompt_for_control(
+                    listen=True,
+                    prefix="I did not hear ready, check, or help. ",
+                )
+                return
             self.handle_guess(text)
 
-    def start_round(self, shuffle_target: bool = False) -> None:
+    def start_round(
+        self,
+        shuffle_target: bool = False,
+        require_vision_target_shuffle: bool = False,
+        announce_rules: bool = True,
+    ) -> None:
         self.awaiting_replay_response = False
+        if require_vision_target_shuffle:
+            self.previous_vision_target = list(self.game.target_sequence)
+            self.awaiting_vision_target_shuffle = True
+            logger.info("Vision replay requires bottom-row shuffle from previous target=%s", self.previous_vision_target)
+        else:
+            self.previous_vision_target = None
+            self.awaiting_vision_target_shuffle = False
         if shuffle_target:
             self.game.shuffle_target_sequence()
         round_state = self.game.start_round()
@@ -319,12 +373,17 @@ class CupGameOrchestrator:
             round_state["target_length"],
             round_state["max_attempts"],
         )
-        self.say(round_state["instruction"], event="round_started", data=round_state)
+        message = round_state["instruction"] if announce_rules else "New game started."
+        self.say(message, event="round_started", data=round_state)
         self.prompt_for_control(listen=True)
 
-    def prompt_for_replay(self, listen: bool = False) -> None:
+    def prompt_for_replay(self, listen: bool = False, prefix: str = "") -> None:
         self.awaiting_replay_response = True
-        self.say("Do you want to play again? Say yes or no.", event="play_again_prompt", wait=listen)
+        self.say_listening_prompt(
+            "%sDo you want to play again? Say yes or no." % prefix,
+            event="play_again_prompt",
+            listen=listen,
+        )
         if listen and self.flags["audio_input_mode"] == "pc":
             self.handle_pc_audio_turn()
 
@@ -332,8 +391,12 @@ class CupGameOrchestrator:
         lowered = text.lower()
         if re.search(r"\b(yes|yeah|yep|sure|again|play again|restart)\b", lowered):
             logger.info("Replay accepted by user: %s", text)
-            self.say("Great. I shuffled the hidden row. Starting a new game.", event="play_again", wait=True)
-            self.start_round(shuffle_target=True)
+            self.say(self.replay_start_message(), event="play_again", wait=False)
+            self.start_round(
+                shuffle_target=self.should_shuffle_target_on_replay(),
+                require_vision_target_shuffle=self.should_require_target_shuffle_on_replay(),
+                announce_rules=False,
+            )
             return
         if re.search(r"\b(no|nope|stop|not now|quit)\b", lowered):
             logger.info("Replay declined by user: %s", text)
@@ -341,27 +404,111 @@ class CupGameOrchestrator:
             self.say("Okay. The game is finished.", event="play_again")
             return
         logger.info("Replay response unclear: %s", text)
-        self.say("Please say yes to play again, or no to finish.", event="play_again_prompt", wait=True)
-        if self.flags["audio_input_mode"] == "pc":
-            self.handle_pc_audio_turn()
+        self.prompt_for_replay(
+            listen=(self.flags["audio_input_mode"] == "pc"),
+            prefix="Please say yes to play again, or no to finish. ",
+        )
 
-    def prompt_for_control(self, listen: bool = False) -> None:
+    def prompt_for_control(
+        self,
+        listen: bool = False,
+        prefix: str = "",
+        pause_before_listen: bool = False,
+    ) -> None:
         if self.flags["audio_input_mode"] == "pc" and not self.game.finished:
             logger.info("Ready for user control word: ready, check, or help")
-            prompt = (
-                "Please say the current top row colors from left to right. Say help if you need a clue."
-                if self.is_dev_speech_sequence_mode()
-                else "Say ready or check when you want me to evaluate the top row. Say help if you need a clue."
-            )
-            self.say(
-                prompt,
-                wait=listen,
-            )
+            prompt = self.control_prompt_text(pause_before_listen=pause_before_listen)
+            self.say_listening_prompt("%s%s" % (prefix, prompt), listen=listen)
             if listen:
-                self.handle_pc_audio_turn()
+                capture_seconds = self.pc_mic_capture_seconds
+                if pause_before_listen and self.rearrange_pause_seconds > 0:
+                    capture_seconds += self.rearrange_pause_seconds
+                    logger.info(
+                        "Listening for %.1f seconds so the player can rearrange cups and answer when ready",
+                        capture_seconds,
+                    )
+                self.handle_pc_audio_turn(capture_seconds=capture_seconds)
+
+    def control_prompt_text(self, pause_before_listen: bool = False) -> str:
+        if self.is_dev_speech_sequence_mode():
+            return "Please say the current top row colors from left to right. Say help if you need a clue."
+        if self.uses_vision_sequence_input():
+            if pause_before_listen:
+                return "Take a moment to rearrange the cups. When you are ready, say ready or check. Say help if you need a clue."
+            return "Say ready or check when you want me to evaluate the top row. Say help if you need a clue."
+        return "Say ready or check when you want me to evaluate the top row. Say help if you need a clue."
 
     def is_dev_speech_sequence_mode(self) -> bool:
         return bool(self.flags.get("dev_speech_sequence_mode", False))
+
+    def uses_voice_sequence_input(self) -> bool:
+        return str(self.flags.get("player_input_mode", "")).lower() == "speech"
+
+    def should_speak_listening_prompt(self) -> bool:
+        return not (self.pc_audio_barge_in_enabled and self.speech.is_busy())
+
+    def say_listening_prompt(self, message: str, event: str = "say", listen: bool = False) -> None:
+        # These prompts tell the user what can be said next, so queue them after
+        # feedback instead of silently skipping the instruction.
+        if self.pc_audio_barge_in_enabled and self.speech.is_busy():
+            logger.info("Waiting for active PC speech before listening prompt: %s", message)
+            self.speech.wait_for_idle()
+        self.say(message, event=event, wait=(listen and not self.pc_audio_barge_in_enabled))
+
+    def stop_pc_prompt_for_barge_in(self) -> bool:
+        if self.speech.is_busy():
+            logger.info("User speech detected during PC prompt; stopping prompt for barge-in")
+            self.speech.stop_all()
+            return True
+        return False
+
+    def uses_vision_sequence_input(self) -> bool:
+        return str(self.flags.get("player_input_mode", "")).lower() == "vision"
+
+    def should_shuffle_target_on_replay(self) -> bool:
+        return self.uses_voice_sequence_input()
+
+    def should_require_target_shuffle_on_replay(self) -> bool:
+        return self.uses_vision_sequence_input()
+
+    def replay_start_message(self) -> str:
+        if self.uses_voice_sequence_input():
+            return "Great. I picked a new hidden sequence. Starting a new game."
+        if self.uses_vision_sequence_input():
+            return "Great. Please shuffle the bottom row, then say ready or check."
+        return "Great. Starting a new game."
+
+    def normalize_color_sequence(self, value: object) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(color).strip().lower() for color in value if str(color).strip()]
+
+    def validate_vision_target_shuffle(
+        self,
+        bottom_row: List[str],
+        vision_result: Dict[str, object],
+    ) -> Optional[Dict[str, object]]:
+        target_length = len(self.previous_vision_target or self.game.target_sequence)
+        if len(bottom_row) != target_length:
+            return {
+                "status": "needs_target_shuffle",
+                "reply": "I need to read all %s cups in the bottom row before we start. Please shuffle the bottom row, then say ready or check." % target_length,
+                "bottom_row_detected": bottom_row,
+                "vision": vision_result,
+            }
+        if self.previous_vision_target and bottom_row == self.previous_vision_target:
+            return {
+                "status": "needs_target_shuffle",
+                "reply": "The bottom row still looks the same. Please shuffle the bottom row before we start again.",
+                "bottom_row_detected": bottom_row,
+                "previous_target": self.previous_vision_target,
+                "vision": vision_result,
+            }
+
+        self.awaiting_vision_target_shuffle = False
+        self.previous_vision_target = None
+        logger.info("Accepted shuffled vision target: %s", bottom_row)
+        return None
 
     def request_pepper_vision_check(self) -> None:
         with self.pepper_vision_check_lock:

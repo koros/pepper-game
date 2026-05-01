@@ -9,6 +9,13 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+try:
+    from fixed_slot_detector.config import PipelineConfig
+    from fixed_slot_detector.detector import PepperCupDetector
+except ModuleNotFoundError:
+    from server.fixed_slot_detector.config import PipelineConfig
+    from server.fixed_slot_detector.detector import PepperCupDetector
+
 
 logger = logging.getLogger("vision")
 COLOR_RANGES = {
@@ -18,6 +25,10 @@ COLOR_RANGES = {
     "green": [((36, 50, 50), (85, 255, 255))],
     "blue": [((86, 50, 50), (130, 255, 255))],
     "purple": [((131, 45, 45), (169, 255, 255))],
+}
+DETECTOR_COLOR_MAP = {
+    "pink": "purple",
+    "mint": "green",
 }
 
 
@@ -48,9 +59,13 @@ class VisionService:
         self.window_name = window_name
         self.frame_count = 0
         self.last_frame: Optional[np.ndarray] = None
+        self.latest_live_frame: Optional[np.ndarray] = None
+        self.latest_live_frame_at = 0.0
         self.preview_lock = threading.Lock()
+        self.camera_lock = threading.Lock()
         self.preview_running = False
         self.live_running = False
+        self.detector = PepperCupDetector(PipelineConfig())
 
         if self.preview_enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -66,41 +81,85 @@ class VisionService:
                 live_thread.start()
                 logger.info("Vision live camera thread started")
 
-    def decode_bgr(self, width: int, height: int, data: bytes) -> np.ndarray:
-        logger.debug("Decoding BGR frame: width=%s height=%s bytes=%s", width, height, len(data))
-        return np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+    def decode_pepper_rgb(self, width: int, height: int, data: bytes) -> np.ndarray:
+        logger.debug("Decoding Pepper RGB frame: width=%s height=%s bytes=%s", width, height, len(data))
+        rgb_frame = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+        return cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
 
     def capture_pc_frame(self) -> Optional[np.ndarray]:
+        if self.live_running:
+            frame = self.wait_for_latest_live_frame()
+            if frame is not None:
+                logger.info("Using latest live PC camera frame for cup check: shape=%s", frame.shape)
+                return frame
+            logger.warning("No recent live PC camera frame available for cup check")
+            return None
+
         logger.info("Opening PC camera index %s", self.pc_camera_index)
-        camera = cv2.VideoCapture(self.pc_camera_index)
-        try:
+        with self.camera_lock:
+            camera = cv2.VideoCapture(self.pc_camera_index)
+            try:
+                ok, frame = camera.read()
+                if not ok:
+                    logger.warning("PC camera capture failed")
+                    return None
+                logger.info("PC camera frame captured: shape=%s", frame.shape)
+                return frame
+            finally:
+                camera.release()
+                logger.info("PC camera released")
+
+    def wait_for_latest_live_frame(self, max_age_seconds: float = 2.0, timeout_seconds: float = 1.5) -> Optional[np.ndarray]:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            with self.camera_lock:
+                if self.latest_live_frame is not None and time.time() - self.latest_live_frame_at <= max_age_seconds:
+                    return self.latest_live_frame.copy()
+            time.sleep(0.05)
+        return None
+
+    def remember_live_frame(self, frame: np.ndarray) -> None:
+        with self.camera_lock:
+            self.latest_live_frame = frame.copy()
+            self.latest_live_frame_at = time.time()
+
+    def read_live_camera_frame(self, camera) -> Optional[np.ndarray]:
+        with self.camera_lock:
             ok, frame = camera.read()
             if not ok:
-                logger.warning("PC camera capture failed")
                 return None
-            logger.info("PC camera frame captured: shape=%s", frame.shape)
+            self.latest_live_frame = frame.copy()
+            self.latest_live_frame_at = time.time()
             return frame
-        finally:
-            camera.release()
-            logger.info("PC camera released")
 
     def detect_cups(self, frame: np.ndarray, source: str = "camera") -> Dict[str, object]:
-        logger.info("Running two-row cup detection on frame shape=%s source=%s", frame.shape, source)
-        height = frame.shape[0]
-        width = frame.shape[1]
-        split_y = height // 2
-        top = self.detect_row(frame[:split_y, :], 0, "top")
-        bottom = self.detect_row(frame[split_y:, :], split_y, "bottom")
-        all_cups = top["cups"] + bottom["cups"]
+        logger.info("Running fixed-slot cup detection on frame shape=%s source=%s", frame.shape, source)
+        height, width = frame.shape[:2]
+        result = self.detect_cups_fixed_slots(frame)
+        top = result["rows"]["top"]
+        bottom = result["rows"]["bottom"]
+        all_cups = result["cups"]
         logger.info("Detected top row: %s", top["sequence"])
         logger.info("Detected bottom row: %s", bottom["sequence"])
-        display_frame = self.draw_detections(frame, all_cups, split_y, source)
+        self.log_detected_board(top["sequence"], bottom["sequence"])
+        display_frame = result["annotated_frame"]
+        self.draw_text_overlay(
+            display_frame,
+            "%s %sx%s | Press s to save current frame" % (source, width, height),
+            (12, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            thickness=2,
+        )
         self.show_and_handle_keys(display_frame)
         return {
             "cup_count": len(all_cups),
             "source": source,
             "frame_width": width,
             "frame_height": height,
+            "roi": result["roi"],
+            "divider_y": result["divider_y"],
             "top_row": top["sequence"],
             "bottom_row": bottom["sequence"],
             "sequence": top["sequence"],
@@ -110,6 +169,76 @@ class VisionService:
                 "bottom": bottom,
             },
         }
+
+    def detect_cups_fixed_slots(self, frame: np.ndarray) -> Dict[str, object]:
+        roi = self.detector.detect_board_roi(frame)
+        x, y, w, h = roi
+        roi_bgr = frame[y : y + h, x : x + w].copy()
+        divider_y = self.detector.estimate_divider_y(roi_bgr)
+        detections = self.detector.extract_cups_from_roi(roi_bgr, divider_y)
+
+        annotated_roi = self.detector.annotate_roi(roi_bgr, detections, divider_y)
+        annotated_frame = frame.copy()
+        annotated_frame[y : y + h, x : x + w] = annotated_roi
+        cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        rows = {
+            "top": {"cup_count": 0, "boxes": [], "cups": [], "sequence": []},
+            "bottom": {"cup_count": 0, "boxes": [], "cups": [], "sequence": []},
+        }
+        cups = []
+        for detection in self.detector.order_row(detections, "upper") + self.detector.order_row(detections, "lower"):
+            row = "top" if detection.row == "upper" else "bottom"
+            local_x, local_y, box_w, box_h = detection.bbox
+            box = (int(x + local_x), int(y + local_y), int(box_w), int(box_h))
+            color = self.normalize_detector_color(detection.color)
+            cup = {
+                "box": box,
+                "color": color,
+                "raw_color": detection.color,
+                "row": row,
+                "score": float(detection.score),
+            }
+            cups.append(cup)
+            rows[row]["boxes"].append(box)
+            rows[row]["cups"].append(cup)
+            rows[row]["sequence"].append(color)
+
+        for row in rows.values():
+            row["cup_count"] = len(row["cups"])
+
+        return {
+            "roi": roi,
+            "divider_y": divider_y,
+            "cups": cups,
+            "rows": rows,
+            "annotated_frame": annotated_frame,
+        }
+
+    def normalize_detector_color(self, color: str) -> str:
+        return DETECTOR_COLOR_MAP.get(color, color)
+
+    def log_detected_board(self, top_row: List[str], bottom_row: List[str]) -> None:
+        slot_count = max(len(top_row), len(bottom_row), 4)
+        top_cells = self.format_board_cells(top_row, slot_count)
+        bottom_cells = self.format_board_cells(bottom_row, slot_count)
+        divider = "|%s|" % "|".join(["-" * 10 for _ in range(slot_count)])
+        banner = "=" * max(len(top_cells) + 9, 58)
+        logger.warning(
+            "\n%s\nCUP BOARD DETECTED\nTOP    %s\n       %s\nBOTTOM %s\n%s",
+            banner,
+            top_cells,
+            divider,
+            bottom_cells,
+            banner,
+        )
+
+    def format_board_cells(self, row: List[str], slot_count: int) -> str:
+        cells = []
+        for index in range(slot_count):
+            value = row[index] if index < len(row) else "?"
+            cells.append((" " + str(value).upper() + " ").center(10))
+        return "|%s|" % "|".join(cells)
 
     def detect_row(self, frame: np.ndarray, y_offset: int, row_name: str) -> Dict[str, object]:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -285,8 +414,8 @@ class VisionService:
         next_analysis_at = 0.0
         try:
             while self.live_running and self.preview_enabled:
-                ok, frame = camera.read()
-                if not ok:
+                frame = self.read_live_camera_frame(camera)
+                if frame is None:
                     logger.warning("Live PC camera preview read failed")
                     time.sleep(0.5)
                     continue
@@ -335,10 +464,10 @@ class VisionService:
 
     def check_pepper_frame(self, width: int, height: int, data: bytes) -> Dict[str, object]:
         logger.info("Checking Pepper camera frame")
-        return self.detect_cups(self.decode_bgr(width, height, data), source="pepper")
+        return self.detect_cups(self.decode_pepper_rgb(width, height, data), source="pepper")
 
     def preview_pepper_frame(self, width: int, height: int, data: bytes) -> None:
-        frame = self.decode_bgr(width, height, data)
+        frame = self.decode_pepper_rgb(width, height, data)
         self.show_and_handle_keys(self.draw_preview_frame(frame, source="pepper-preview"))
 
     def check_pc_camera(self) -> Dict[str, object]:

@@ -15,6 +15,9 @@ class SpeechService:
         self.rate = rate
         self.volume = volume
         self.lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.current_engine = None
+        self.current_process = None
         self.threads: List[threading.Thread] = []
         logger.info("Initializing PC speech service: enabled=%s rate=%s volume=%s", enabled, rate, volume)
 
@@ -37,6 +40,25 @@ class SpeechService:
             except ValueError:
                 pass
 
+    def is_busy(self) -> bool:
+        self.threads = [thread for thread in self.threads if thread.is_alive()]
+        return any(thread.is_alive() for thread in self.threads)
+
+    def stop_all(self) -> None:
+        with self.state_lock:
+            engine = self.current_engine
+            process = self.current_process
+        if engine:
+            try:
+                engine.stop()
+            except Exception as exc:
+                logger.debug("Could not stop pyttsx3 speech: %s", exc)
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError as exc:
+                logger.debug("Could not terminate Windows SAPI speech: %s", exc)
+
     def _say_blocking(self, text: str) -> None:
         with self.lock:
             logger.info("Speaking through PC speakers: %s", text)
@@ -52,8 +74,15 @@ class SpeechService:
             engine.setProperty("rate", self._pyttsx3_rate())
             engine.setProperty("volume", max(0.0, min(float(self.volume) / 100.0, 1.0)))
             engine.say(text)
-            engine.runAndWait()
-            engine.stop()
+            with self.state_lock:
+                self.current_engine = engine
+            try:
+                engine.runAndWait()
+            finally:
+                engine.stop()
+                with self.state_lock:
+                    if self.current_engine is engine:
+                        self.current_engine = None
             return True
         except Exception as exc:
             logger.warning("pyttsx3 speech failed; falling back to Windows SAPI. Error: %s", exc)
@@ -73,11 +102,16 @@ class SpeechService:
             "$speaker.Dispose();"
         ) % (self.rate, self.volume)
         try:
-            subprocess.run(
+            process = subprocess.Popen(
                 ["powershell", "-NoProfile", "-Command", script, text],
-                check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            with self.state_lock:
+                self.current_process = process
+            process.wait()
+            with self.state_lock:
+                if self.current_process is process:
+                    self.current_process = None
         except OSError as exc:
             logger.warning("Windows SAPI speech failed: %s", exc)

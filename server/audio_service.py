@@ -4,8 +4,9 @@ import os
 import logging
 import re
 import tempfile
+import time
 import wave
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -36,13 +37,23 @@ class EnergyVad:
 
 
 class AudioService:
-    def __init__(self, whisper_model: str, vad_threshold: float) -> None:
+    def __init__(
+        self,
+        whisper_model: str,
+        vad_threshold: float,
+        min_speech_frames: int = 3,
+        end_silence_frames: int = 18,
+    ) -> None:
         logger.info(
-            "Initializing audio service: whisper_model=%s energy_vad_threshold=%s",
+            "Initializing audio service: whisper_model=%s energy_vad_threshold=%s min_speech_frames=%s end_silence_frames=%s",
             whisper_model,
             vad_threshold,
+            min_speech_frames,
+            end_silence_frames,
         )
         self.vad = EnergyVad(vad_threshold)
+        self.min_speech_frames = min_speech_frames
+        self.end_silence_frames = end_silence_frames
         logger.info("Loading faster-whisper model. This can take a moment on first run.")
         self.whisper = WhisperModel(whisper_model, device="cpu", compute_type="int8")
         logger.info("Audio service ready")
@@ -98,7 +109,7 @@ class AudioService:
                 logger.warning("Could not remove temporary WAV: %s", wav_path)
                 pass
 
-    def capture_pc_mic(self, seconds: float = 4.0) -> bytes:
+    def capture_pc_mic(self, seconds: float = 7.0) -> bytes:
         logger.info("Capturing PC microphone audio for %.1f seconds", seconds)
         frames = int(seconds * SAMPLE_RATE)
         audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1, dtype="int16")
@@ -106,8 +117,80 @@ class AudioService:
         logger.info("PC microphone capture complete: %s bytes", audio.nbytes)
         return audio.tobytes()
 
-    def capture_and_transcribe_pc_mic(self, seconds: float = 4.0) -> str:
-        return self.transcribe_pcm(self.capture_pc_mic(seconds))
+    def capture_pc_mic_until_silence(
+        self,
+        max_seconds: float = 7.0,
+        on_speech_start: Optional[Callable[[], bool]] = None,
+        reset_after_callback_seconds: float = 0.35,
+        reset_extra_seconds: float = 4.0,
+    ) -> bytes:
+        logger.info("Streaming PC microphone audio for up to %.1f seconds", max_seconds)
+        block_frames = int(SAMPLE_RATE * FRAME_MS / 1000)
+        deadline = time.monotonic() + max_seconds
+        captured = bytearray()
+        active = False
+        speech_frames = 0
+        silence_frames = 0
+        ignore_until = 0.0
+
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="int16",
+            blocksize=block_frames,
+        ) as stream:
+            while time.monotonic() < deadline:
+                frame, overflowed = stream.read(block_frames)
+                if overflowed:
+                    logger.warning("PC microphone input overflowed while listening")
+
+                frame_bytes = bytes(frame)
+                if time.monotonic() < ignore_until:
+                    continue
+
+                captured.extend(frame_bytes)
+                is_speech = self.vad.is_speech(frame_bytes)
+
+                if is_speech:
+                    speech_frames += 1
+                    silence_frames = 0
+                else:
+                    silence_frames += 1
+
+                if not active and speech_frames >= self.min_speech_frames:
+                    active = True
+                    logger.info("Speech start detected in PC microphone stream")
+                    if on_speech_start and on_speech_start():
+                        logger.info("Resetting PC microphone capture after stopping prompt echo")
+                        captured = bytearray()
+                        active = False
+                        speech_frames = 0
+                        silence_frames = 0
+                        ignore_until = time.monotonic() + reset_after_callback_seconds
+                        deadline = max(deadline, time.monotonic() + reset_extra_seconds)
+                        continue
+
+                if active and silence_frames >= self.end_silence_frames:
+                    logger.info(
+                        "Speech end detected in PC microphone stream after %s bytes",
+                        len(captured),
+                    )
+                    break
+
+                if not active and not is_speech:
+                    speech_frames = 0
+
+        logger.info("PC microphone streaming capture complete: %s bytes", len(captured))
+        return bytes(captured)
+
+    def capture_and_transcribe_pc_mic(
+        self,
+        seconds: float = 7.0,
+        on_speech_start: Optional[Callable[[], bool]] = None,
+    ) -> str:
+        return self.transcribe_pcm(
+            self.capture_pc_mic_until_silence(seconds, on_speech_start=on_speech_start)
+        )
 
 
 class UtteranceBuffer:

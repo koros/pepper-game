@@ -5,7 +5,7 @@ import threading
 import time
 
 
-PC_IP = "169.254.61.236"
+PC_IP = "127.0.0.1"
 COMMAND_PORT = 50010
 AUDIO_PORT = 50011
 VISION_PORT = 50012
@@ -15,7 +15,7 @@ RESULT_PORT = 50013
 AUDIO_INPUT_MODE = "pc"   # "pepper" or "pc"
 VISION_INPUT_MODE = "pc"  # "pepper" or "pc"
 SPEECH_OUTPUT_MODE = "pc" # "pepper" or "pc"
-PLAYER_INPUT_MODE = "speech"  # "vision" or "speech"
+PLAYER_INPUT_MODE = "vision"  # "vision" or "speech"
 
 PEPPER_VISION_STREAM_ENABLED = True
 PEPPER_CAMERA_RESOLUTION = 2  # 1=320x240, 2=640x480
