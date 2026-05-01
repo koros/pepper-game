@@ -22,7 +22,7 @@ CONFIG_DIR = ROOT / "config"
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 
 
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.WARNING, format=LOG_FORMAT, datefmt="%H:%M:%S")
 logger = logging.getLogger("orchestrator")
 vision_logger = logging.getLogger("vision")
 
@@ -67,12 +67,22 @@ class CupGameOrchestrator:
             whisper_model=str(flags["whisper_model"]),
             vad_threshold=float(flags["energy_vad_threshold"]),
             min_speech_frames=int(flags["energy_vad_min_speech_frames"]),
-            end_silence_frames=int(flags["energy_vad_end_silence_frames"]),
+            end_silence_frames=int(
+                flags.get(
+                    "pc_audio_end_silence_frames",
+                    flags["energy_vad_end_silence_frames"],
+                )
+            ),
         )
         self.audio_buffer = UtteranceBuffer(
             vad_threshold=float(flags["energy_vad_threshold"]),
             min_speech_frames=int(flags["energy_vad_min_speech_frames"]),
-            end_silence_frames=int(flags["energy_vad_end_silence_frames"]),
+            end_silence_frames=int(
+                flags.get(
+                    "pepper_audio_end_silence_frames",
+                    flags["energy_vad_end_silence_frames"],
+                )
+            ),
         )
         self.vision = VisionService(
             pc_camera_index=int(flags["pc_camera_index"]),
@@ -82,6 +92,8 @@ class CupGameOrchestrator:
                 and str(flags.get("vision_input_mode", "pc")) == "pc"
             ),
             live_analysis_interval=float(flags.get("vision_live_analysis_interval", 2.0)),
+            periodic_check_enabled=bool(flags.get("vision_periodic_check_enabled", False)),
+            periodic_check_interval=float(flags.get("vision_periodic_check_interval", 7.0)),
             save_dir=str(ROOT / str(flags.get("vision_save_dir", "captured_frames"))),
             window_name=str(flags.get("vision_window_name", "Pepper Cup Game Vision")),
         )
@@ -176,10 +188,22 @@ class CupGameOrchestrator:
                         len(data),
                     )
                     result = self.vision.check_pepper_frame(width, height, data)
-                    self.handle_vision_result(result)
+                    self.start_vision_result_handler(result)
                 else:
                     self.log_pepper_preview_frame(width, height, len(data))
                     self.vision.preview_pepper_frame(width, height, data)
+
+    def start_vision_result_handler(self, result: Dict[str, object]) -> None:
+        # Keep the vision socket free to receive preview frames while speech/audio
+        # feedback for a check result runs in the background.
+        thread = threading.Thread(
+            target=self.handle_vision_result,
+            args=(result,),
+            name="vision-result-handler",
+        )
+        thread.daemon = True
+        thread.start()
+        logger.info("Dispatched Pepper vision result handler; preview stream remains active")
 
     def result_loop(self) -> None:
         server = listen(self.host, self.ports["result_port"])

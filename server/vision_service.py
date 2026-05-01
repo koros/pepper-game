@@ -23,7 +23,6 @@ COLOR_RANGES = {
     "orange": [((11, 80, 60), (24, 255, 255))],
     "yellow": [((25, 70, 70), (35, 255, 255))],
     "green": [((36, 50, 50), (85, 255, 255))],
-    "blue": [((86, 50, 50), (130, 255, 255))],
     "purple": [((131, 45, 45), (169, 255, 255))],
 }
 DETECTOR_COLOR_MAP = {
@@ -43,15 +42,19 @@ class VisionService:
         preview_enabled: bool = True,
         live_preview_enabled: bool = False,
         live_analysis_interval: float = 2.0,
+        periodic_check_enabled: bool = False,
+        periodic_check_interval: float = 7.0,
         save_dir: str = "captured_frames",
         window_name: str = "Pepper Cup Game Vision",
     ) -> None:
         logger.info(
-            "Initializing vision service: pc_camera_index=%s preview_enabled=%s live_preview_enabled=%s live_analysis_interval=%s save_dir=%s window_name=%s",
+            "Initializing vision service: pc_camera_index=%s preview_enabled=%s live_preview_enabled=%s live_analysis_interval=%s periodic_check_enabled=%s periodic_check_interval=%s save_dir=%s window_name=%s",
             pc_camera_index,
             preview_enabled,
             live_preview_enabled,
             live_analysis_interval,
+            periodic_check_enabled,
+            periodic_check_interval,
             save_dir,
             window_name,
         )
@@ -59,6 +62,9 @@ class VisionService:
         self.preview_enabled = preview_enabled
         self.live_preview_enabled = live_preview_enabled
         self.live_analysis_interval = live_analysis_interval
+        self.periodic_check_enabled = periodic_check_enabled
+        self.periodic_check_interval = periodic_check_interval
+        self.next_periodic_check_at = 0.0
         self.save_dir = Path(save_dir)
         self.window_name = window_name
         self.frame_count = 0
@@ -223,7 +229,7 @@ class VisionService:
         return DETECTOR_COLOR_MAP.get(color, color)
 
     def log_detected_board(self, top_row: List[str], bottom_row: List[str]) -> None:
-        slot_count = max(len(top_row), len(bottom_row), 4)
+        slot_count = max(len(top_row), len(bottom_row), self.detector.config.expected_cups_per_row)
         top_cells = self.format_board_cells(top_row, slot_count)
         bottom_cells = self.format_board_cells(bottom_row, slot_count)
         divider = "|%s|" % "|".join(["-" * 10 for _ in range(slot_count)])
@@ -423,8 +429,13 @@ class VisionService:
                     continue
                 now = time.time()
                 if now >= next_analysis_at:
-                    self.detect_cups(frame, source="pc-live")
-                    next_analysis_at = now + self.live_analysis_interval
+                    if self.periodic_check_enabled:
+                        logger.warning("Periodic dev vision check from PC webcam")
+                        self.detect_cups(frame, source="pc-live-periodic")
+                        next_analysis_at = now + self.periodic_check_interval
+                    else:
+                        self.detect_cups(frame, source="pc-live")
+                        next_analysis_at = now + self.live_analysis_interval
                 else:
                     self.show_and_handle_keys(self.draw_preview_frame(frame, source="pc-live"))
                 time.sleep(0.2)
@@ -479,7 +490,20 @@ class VisionService:
 
     def preview_pepper_frame(self, width: int, height: int, data: bytes) -> None:
         frame = self.decode_pepper_rgb(width, height, data)
+        if self.should_run_periodic_check():
+            logger.warning("Periodic dev vision check from Pepper preview stream")
+            self.detect_cups(frame, source="pepper-periodic")
+            return
         self.show_and_handle_keys(self.draw_preview_frame(frame, source="pepper-preview"))
+
+    def should_run_periodic_check(self) -> bool:
+        if not self.periodic_check_enabled:
+            return False
+        now = time.time()
+        if now < self.next_periodic_check_at:
+            return False
+        self.next_periodic_check_at = now + self.periodic_check_interval
+        return True
 
     def check_pc_camera(self) -> Dict[str, object]:
         logger.info("Checking PC camera frame")

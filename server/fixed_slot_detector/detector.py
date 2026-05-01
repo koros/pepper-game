@@ -13,7 +13,6 @@ from .types import CupDetection
 DRAW_COLORS = {
     "pink": (255, 0, 255),
     "yellow": (0, 255, 255),
-    "blue": (255, 120, 0),
     "mint": (120, 255, 120),
 }
 
@@ -179,9 +178,9 @@ class PepperCupDetector:
         """
         Game-specific detector.
 
-        The game always has exactly 4 cup positions per row and one cup of
+        The game always has exactly 3 cup positions per row and one cup of
         each known colour. This method:
-        1. splits each row into 4 fixed slots,
+        1. splits each row into fixed slots,
         2. scores every colour inside every slot,
         3. chooses the best left-to-right colour assignment while using each
            colour only once per row.
@@ -241,7 +240,7 @@ class PepperCupDetector:
                 bbox_matrix.append(slot_bboxes)
 
             # Find the best assignment where each known colour appears once.
-            # For 4 cups this is only 24 permutations, so it is simple and fast.
+            # With a small fixed cup count, this remains simple and fast.
             best_perm: Optional[Tuple[int, ...]] = None
             best_total = -1
             for perm in permutations(range(len(colors)), self.config.slot_count):

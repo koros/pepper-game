@@ -4,6 +4,11 @@ import struct
 import threading
 import time
 
+try:
+    from naoqi import ALModule
+except Exception:
+    ALModule = None
+
 
 PC_IP = "127.0.0.1"
 COMMAND_PORT = 50010
@@ -12,7 +17,7 @@ VISION_PORT = 50012
 RESULT_PORT = 50013
 
 # Manual user flags. Change these before running the Choregraphe behavior.
-AUDIO_INPUT_MODE = "pepper"   # "pepper" or "pc"
+AUDIO_INPUT_MODE = "pc"       # "pepper" or "pc"
 VISION_INPUT_MODE = "pepper"  # "pepper" or "pc"
 SPEECH_OUTPUT_MODE = "pepper" # "pepper" or "pc"
 PLAYER_INPUT_MODE = "vision"  # "vision" or "speech"
@@ -20,10 +25,27 @@ PLAYER_INPUT_MODE = "vision"  # "vision" or "speech"
 PEPPER_VISION_STREAM_ENABLED = True
 PEPPER_CAMERA_RESOLUTION = 2  # 1=320x240, 2=640x480
 PEPPER_CAMERA_FPS = 5
-PEPPER_AUDIO_STREAM_ENABLED = True
+PEPPER_CAMERA_COLOR_SPACE = 11
+PEPPER_CAMERA_EMPTY_FRAME_LIMIT = 5
+PEPPER_AUDIO_STREAM_ENABLED = False
 AUDIO_SUBSCRIBER_NAME = "Game_3"
 PEPPER_HEAD_YAW = 0.0
 PEPPER_HEAD_PITCH = 0.25
+
+AUDIO_MODULES = {}
+
+
+if ALModule:
+    class PepperAudioModule(ALModule):
+        def __init__(self, name, owner):
+            ALModule.__init__(self, name)
+            self.owner = owner
+
+        def processRemote(self, nbOfChannels, nbrOfSamplesByChannel, timestamp, buffer):
+            if self.owner:
+                self.owner.processRemote(nbOfChannels, nbrOfSamplesByChannel, timestamp, buffer)
+else:
+    PepperAudioModule = None
 
 
 class MyClass(GeneratedClass):
@@ -51,6 +73,8 @@ class MyClass(GeneratedClass):
         self.speech_ids = []
         self.active_audio_input_mode = AUDIO_INPUT_MODE
         self.active_audio_subscriber_name = None
+        self.audio_module = None
+        self.audio_module_name = None
 
         self.awareness_was_enabled = None
         self.vision_motion_paused = False
@@ -117,6 +141,7 @@ class MyClass(GeneratedClass):
         self.stop_pepper_vision_stream()
         self.restore_head_motion_after_vision()
         self.unsubscribe_audio()
+        self.release_audio_module()
         self.unsubscribe_video()
         self.stop_speech()
 
@@ -362,27 +387,30 @@ class MyClass(GeneratedClass):
             self.logger.error("AUDIO_INPUT_MODE is pepper, but ALAudioDevice is unavailable.")
             return False
 
-        for subscriber_name in self.audio_subscriber_name_candidates():
-            try:
-                self.logger.info("Trying Pepper microphone subscriber name=%s." % subscriber_name)
-                self.audio.setClientPreferences(subscriber_name, 16000, 3, 0)
-                self.audio.subscribe(subscriber_name)
-                self.audio_subscribed = True
-                self.active_audio_subscriber_name = subscriber_name
-                self.logger.info(
-                    "Pepper microphone streaming started with subscriber name=%s."
-                    % subscriber_name
-                )
-                return True
-            except Exception as e:
-                self.audio_subscribed = False
-                self.active_audio_subscriber_name = None
-                self.logger.warning(
-                    "Pepper microphone subscriber name=%s failed: %s"
-                    % (subscriber_name, str(e))
-                )
+        subscriber_name = self.ensure_audio_module()
+        if not subscriber_name:
+            self.logger.error("Pepper microphone streaming could not start because no audio callback module is registered.")
+            self.close_socket(self.audio_socket)
+            self.audio_socket = None
+            return False
 
-        self.logger.error("Pepper microphone streaming could not start with any subscriber name.")
+        try:
+            self.logger.info("Starting Pepper microphone with callback module=%s." % subscriber_name)
+            self.audio.setClientPreferences(subscriber_name, 16000, 3, 0)
+            self.audio.subscribe(subscriber_name)
+            self.audio_subscribed = True
+            self.active_audio_subscriber_name = subscriber_name
+            self.logger.info(
+                "Pepper microphone streaming started with subscriber name=%s."
+                % subscriber_name
+            )
+            return True
+        except Exception as e:
+            self.audio_subscribed = False
+            self.active_audio_subscriber_name = None
+            self.logger.error("Pepper microphone streaming could not start: " + str(e))
+            self.release_audio_module()
+
         self.close_socket(self.audio_socket)
         self.audio_socket = None
         return False
@@ -404,25 +432,43 @@ class MyClass(GeneratedClass):
     def audio_subscriber_name(self):
         return str(self.active_audio_subscriber_name or AUDIO_SUBSCRIBER_NAME)
 
-    def audio_subscriber_name_candidates(self):
-        names = []
-        self.add_audio_subscriber_candidate(names, AUDIO_SUBSCRIBER_NAME)
-        try:
-            self.add_audio_subscriber_candidate(names, self.getName())
-        except Exception:
-            pass
-        try:
-            name = str(self.getName())
-            self.add_audio_subscriber_candidate(names, name.split("/")[-1])
-            self.add_audio_subscriber_candidate(names, name.split(":")[-1])
-        except Exception:
-            pass
-        return names
+    def ensure_audio_module(self):
+        if self.audio_module_name and self.audio_module:
+            return self.audio_module_name
 
-    def add_audio_subscriber_candidate(self, names, value):
-        name = str(value).strip()
-        if name and name not in names:
-            names.append(name)
+        if PepperAudioModule is None:
+            self.logger.error("naoqi.ALModule is unavailable; cannot register Pepper audio callback module.")
+            return None
+
+        module_name = "CupGameAudio_%s" % int(time.time() * 1000)
+        try:
+            module = PepperAudioModule(module_name, self)
+            AUDIO_MODULES[module_name] = module
+            self.audio_module = module
+            self.audio_module_name = module_name
+            self.logger.info("Registered Pepper audio callback module=%s." % module_name)
+            return module_name
+        except Exception as e:
+            self.logger.error("Could not register Pepper audio callback module: " + str(e))
+            return None
+
+    def release_audio_module(self):
+        if self.audio_module:
+            try:
+                self.audio_module.owner = None
+            except Exception:
+                pass
+            try:
+                self.audio_module.exit()
+            except Exception:
+                pass
+        if self.audio_module_name in AUDIO_MODULES:
+            try:
+                del AUDIO_MODULES[self.audio_module_name]
+            except Exception:
+                pass
+        self.audio_module = None
+        self.audio_module_name = None
 
     def is_pepper_audio_active(self):
         return self.active_audio_input_mode == "pepper"
@@ -434,28 +480,27 @@ class MyClass(GeneratedClass):
 
         camera_index = 0
         resolution = PEPPER_CAMERA_RESOLUTION
-        color_space = 11
+        color_space = PEPPER_CAMERA_COLOR_SPACE
         fps = PEPPER_CAMERA_FPS
 
         width, height = self.camera_dimensions(resolution)
+        subscriber = None
 
         self.pause_head_motion_for_vision()
 
         try:
-            self.video.setActiveCamera(camera_index)
-
-            self.video_subscriber = self.video.subscribeCamera(
+            subscriber = self.subscribe_pepper_camera(
                 "cup_game_camera",
                 camera_index,
                 resolution,
                 color_space,
-                fps
+                fps,
             )
 
-            image = self.video.getImageRemote(self.video_subscriber)
+            image = self.get_pepper_camera_image_with_retries(subscriber, fps, 8)
 
             if image is None:
-                self.logger.error("No Pepper camera image received.")
+                self.logger.error("No Pepper camera image received after retries.")
                 return
 
             frame_width = int(image[0]) if image[0] else width
@@ -464,7 +509,7 @@ class MyClass(GeneratedClass):
             self.send_image(frame_width, frame_height, image[6])
 
         finally:
-            self.unsubscribe_video()
+            self.unsubscribe_pepper_camera(subscriber, "Pepper one-shot camera")
             self.restore_head_motion_after_vision()
 
     def start_pepper_vision_stream(self):
@@ -497,7 +542,7 @@ class MyClass(GeneratedClass):
     def pepper_vision_stream_loop(self):
         camera_index = 0
         resolution = PEPPER_CAMERA_RESOLUTION
-        color_space = 11
+        color_space = PEPPER_CAMERA_COLOR_SPACE
         fps = PEPPER_CAMERA_FPS
 
         width, height = self.camera_dimensions(resolution)
@@ -506,21 +551,20 @@ class MyClass(GeneratedClass):
         subscriber = None
 
         try:
-            self.video.setActiveCamera(camera_index)
-
-            subscriber = self.video.subscribeCamera(
+            subscriber = self.subscribe_pepper_camera(
                 "cup_game_camera_stream",
                 camera_index,
                 resolution,
                 color_space,
-                fps
+                fps,
             )
 
             self.video_subscriber = subscriber
+            empty_frames = 0
 
             self.logger.info(
-                "Pepper camera stream active resolution=%s width=%s height=%s fps=%s"
-                % (resolution, width, height, fps)
+                "Pepper camera stream active camera=%s resolution=%s width=%s height=%s fps=%s color_space=%s subscriber=%s"
+                % (camera_index, resolution, width, height, fps, color_space, subscriber)
             )
 
             while self.bIsRunning and self.vision_streaming:
@@ -528,10 +572,27 @@ class MyClass(GeneratedClass):
                 image = self.video.getImageRemote(subscriber)
 
                 if image is None:
+                    empty_frames += 1
                     self.logger.warning("No Pepper camera stream image received.")
+                    if empty_frames >= PEPPER_CAMERA_EMPTY_FRAME_LIMIT:
+                        self.logger.warning(
+                            "Pepper camera stream returned %s empty frames; resubscribing."
+                            % empty_frames
+                        )
+                        subscriber = self.resubscribe_pepper_camera(
+                            subscriber,
+                            "cup_game_camera_stream",
+                            camera_index,
+                            resolution,
+                            color_space,
+                            fps,
+                        )
+                        self.video_subscriber = subscriber
+                        empty_frames = 0
                     time.sleep(period)
                     continue
 
+                empty_frames = 0
                 try:
                     frame_width = int(image[0]) if image[0] else width
                     frame_height = int(image[1]) if image[1] else height
@@ -546,18 +607,53 @@ class MyClass(GeneratedClass):
             self.logger.error("Pepper vision stream failed: " + str(e))
 
         finally:
-            if self.video and subscriber:
-                try:
-                    self.video.unsubscribe(subscriber)
-                    self.logger.info("Pepper camera stream unsubscribed.")
-                except Exception:
-                    pass
+            self.unsubscribe_pepper_camera(subscriber, "Pepper camera stream")
 
             if self.video_subscriber == subscriber:
                 self.video_subscriber = None
 
             self.vision_streaming = False
             self.restore_head_motion_after_vision(True)
+
+    def subscribe_pepper_camera(self, name, camera_index, resolution, color_space, fps):
+        self.video.setActiveCamera(camera_index)
+        subscriber = self.video.subscribeCamera(
+            name,
+            camera_index,
+            resolution,
+            color_space,
+            fps,
+        )
+        self.logger.info(
+            "Pepper camera subscribed name=%s subscriber=%s camera=%s resolution=%s fps=%s color_space=%s"
+            % (name, subscriber, camera_index, resolution, fps, color_space)
+        )
+        time.sleep(0.2)
+        return subscriber
+
+    def resubscribe_pepper_camera(self, subscriber, name, camera_index, resolution, color_space, fps):
+        self.unsubscribe_pepper_camera(subscriber, "Pepper camera stream recovery")
+        return self.subscribe_pepper_camera(name, camera_index, resolution, color_space, fps)
+
+    def unsubscribe_pepper_camera(self, subscriber, label):
+        if self.video and subscriber:
+            try:
+                self.video.unsubscribe(subscriber)
+                self.logger.info(label + " unsubscribed.")
+            except Exception as e:
+                self.logger.warning(label + " unsubscribe failed: " + str(e))
+
+    def get_pepper_camera_image_with_retries(self, subscriber, fps, attempts):
+        delay = 1.0 / float(max(fps, 1))
+        for attempt in range(attempts):
+            image = self.video.getImageRemote(subscriber)
+            if image is not None:
+                if attempt > 0:
+                    self.logger.info("Pepper camera image received after retry %s." % attempt)
+                return image
+            self.logger.warning("No Pepper camera image received on attempt %s." % (attempt + 1))
+            time.sleep(delay)
+        return None
 
     def camera_dimensions(self, resolution):
         if resolution == 2:
@@ -678,11 +774,7 @@ class MyClass(GeneratedClass):
 
     def unsubscribe_video(self):
         if self.video and self.video_subscriber:
-            try:
-                self.video.unsubscribe(self.video_subscriber)
-                self.logger.info("Pepper camera unsubscribed.")
-            except Exception:
-                pass
+            self.unsubscribe_pepper_camera(self.video_subscriber, "Pepper camera")
 
             self.video_subscriber = None
 

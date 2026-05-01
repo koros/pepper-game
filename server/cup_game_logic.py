@@ -8,11 +8,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-DEFAULT_COLORS = ["red", "blue", "orange", "yellow", "green", "purple"]
-DEFAULT_TARGET = ["red", "blue", "orange", "yellow"]
+DEFAULT_COLORS = ["purple", "yellow", "green"]
+DEFAULT_TARGET = ["purple", "yellow", "green"]
 COLOR_ALIASES = {
     "centre": "center",
-    "cyan": "blue",
     "gold": "yellow",
     "golden": "yellow",
     "violet": "purple",

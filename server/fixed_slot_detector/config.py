@@ -4,16 +4,15 @@ from typing import Dict, List, Tuple
 
 @dataclass
 class PipelineConfig:
-    color_names: List[str] = field(default_factory=lambda: ["pink", "yellow", "blue", "mint"])
+    color_names: List[str] = field(default_factory=lambda: ["pink", "yellow", "mint"])
     hsv_ranges: Dict[str, List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]] = field(
         default_factory=lambda: {
             "pink": [((145, 50, 60), (179, 255, 255))],
             "yellow": [((18, 90, 120), (40, 255, 255))],
-            "blue": [((90, 40, 30), (130, 255, 255))],
             "mint": [((45, 15, 90), (95, 190, 255))],
         }
     )
-    expected_cups_per_row: int = 4
+    expected_cups_per_row: int = 3
 
     min_board_area: int = 40000
     inner_left_margin_ratio: float = 0.08
@@ -25,10 +24,10 @@ class PipelineConfig:
     min_color_area: int = 3000
 
     # Fixed-slot mode is better for the Pepper game because the board always
-    # contains exactly 4 cup positions per row. It prevents missed edge cups
+    # contains exactly 3 cup positions per row. It prevents missed edge cups
     # and avoids extra false-positive blobs from the background.
     use_fixed_slots: bool = True
-    slot_count: int = 4
+    slot_count: int = 3
     slot_padding_ratio: float = 0.08
     min_slot_color_pixels: int = 250
 
