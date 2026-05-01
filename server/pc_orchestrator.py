@@ -261,7 +261,7 @@ class CupGameOrchestrator:
                 "PC audio requested while audio_input_mode=%s; enabling PC audio fallback",
                 self.flags["audio_input_mode"],
             )
-        logger.info("Starting PC microphone capture turn")
+        logger.warning("Starting PC microphone capture turn")
         if self.pc_audio_barge_in_enabled:
             # Start recording immediately so a user can answer while the prompt is still playing.
             self.send_result("pc_audio_started", "Listening from the PC microphone.")
@@ -273,11 +273,11 @@ class CupGameOrchestrator:
             on_speech_start=self.stop_pc_prompt_for_barge_in if self.pc_audio_barge_in_enabled else None,
         )
         if text:
-            logger.info("Transcribed PC microphone as: %s", text)
+            logger.warning("PC microphone heard: %s", text)
             self.speech.stop_all()
             self.handle_spoken_input(text)
         else:
-            logger.info("PC microphone capture produced no recognized speech")
+            logger.warning("PC microphone capture produced no recognized speech")
             if self.awaiting_replay_response:
                 self.prompt_for_replay(listen=True, prefix="I did not catch that. ")
             else:
@@ -349,7 +349,7 @@ class CupGameOrchestrator:
             return
 
         command = self.game.classify_command(text)
-        logger.info("Spoken input classified as %s: %s", command, text)
+        logger.warning("Spoken input classified as %s: %s", command, text)
         if command == "check":
             self.say("Okay, checking now.", wait=False)
             if self.is_dev_speech_sequence_mode():

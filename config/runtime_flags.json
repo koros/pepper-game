@@ -19,15 +19,15 @@
   "pc_speech_enabled": true,
   "pc_speech_rate": 0,
   "pc_speech_volume": 80,
-  "pc_mic_capture_seconds": 15.0,
+  "pc_mic_capture_seconds": 30.0,
   "rearrange_pause_seconds": 12.0,
   "pc_audio_barge_in_enabled": true,
   "lm_studio_base_url": "http://localhost:1234/v1",
   "lm_studio_model": "bartowski/llama-3.2-1b-instruct",
-  "whisper_model": "base.en",
+  "whisper_model": "tiny.en",
   "energy_vad_threshold": 550,
   "energy_vad_min_speech_frames": 3,
   "energy_vad_end_silence_frames": 18,
-  "pc_audio_end_silence_frames": 35,
+  "pc_audio_end_silence_frames": 80,
   "pepper_audio_end_silence_frames": 45
 }

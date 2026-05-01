@@ -89,7 +89,7 @@ class AudioService:
 
     def transcribe_pcm(self, pcm: bytes) -> str:
         if not self.has_speech(pcm):
-            logger.info("Skipping transcription because VAD found no speech")
+            logger.warning("PC microphone VAD found no speech to transcribe")
             return ""
         wav_path = self.write_wav(pcm)
         try:
@@ -97,9 +97,9 @@ class AudioService:
             segments, _info = self.whisper.transcribe(wav_path, beam_size=5)
             text = " ".join(segment.text.strip() for segment in segments).strip()
             if text and not re.search(r"[A-Za-z0-9]", text):
-                logger.info("Discarding punctuation-only transcription: %s", text)
+                logger.warning("Discarding punctuation-only transcription: %s", text)
                 text = ""
-            logger.info("Transcription complete: %s", text or "[empty]")
+            logger.warning("Whisper transcription from microphone: %s", text or "[empty]")
             return text
         finally:
             try:
@@ -110,11 +110,11 @@ class AudioService:
                 pass
 
     def capture_pc_mic(self, seconds: float = 7.0) -> bytes:
-        logger.info("Capturing PC microphone audio for %.1f seconds", seconds)
+        logger.warning("Capturing PC microphone audio for %.1f seconds", seconds)
         frames = int(seconds * SAMPLE_RATE)
         audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1, dtype="int16")
         sd.wait()
-        logger.info("PC microphone capture complete: %s bytes", audio.nbytes)
+        logger.warning("PC microphone capture complete: %s bytes", audio.nbytes)
         return audio.tobytes()
 
     def capture_pc_mic_until_silence(
@@ -124,7 +124,7 @@ class AudioService:
         reset_after_callback_seconds: float = 0.35,
         reset_extra_seconds: float = 4.0,
     ) -> bytes:
-        logger.info("Streaming PC microphone audio for up to %.1f seconds", max_seconds)
+        logger.warning("Streaming PC microphone audio for up to %.1f seconds", max_seconds)
         block_frames = int(SAMPLE_RATE * FRAME_MS / 1000)
         deadline = time.monotonic() + max_seconds
         captured = bytearray()
@@ -159,9 +159,9 @@ class AudioService:
 
                 if not active and speech_frames >= self.min_speech_frames:
                     active = True
-                    logger.info("Speech start detected in PC microphone stream")
+                    logger.warning("Speech start detected in PC microphone stream")
                     if on_speech_start and on_speech_start():
-                        logger.info("Resetting PC microphone capture after stopping prompt echo")
+                        logger.warning("Resetting PC microphone capture after stopping prompt echo")
                         captured = bytearray()
                         active = False
                         speech_frames = 0
@@ -171,7 +171,7 @@ class AudioService:
                         continue
 
                 if active and silence_frames >= self.end_silence_frames:
-                    logger.info(
+                    logger.warning(
                         "Speech end detected in PC microphone stream after %s bytes",
                         len(captured),
                     )
@@ -180,7 +180,7 @@ class AudioService:
                 if not active and not is_speech:
                     speech_frames = 0
 
-        logger.info("PC microphone streaming capture complete: %s bytes", len(captured))
+        logger.warning("PC microphone streaming capture complete: %s bytes", len(captured))
         return bytes(captured)
 
     def capture_and_transcribe_pc_mic(
@@ -188,9 +188,64 @@ class AudioService:
         seconds: float = 7.0,
         on_speech_start: Optional[Callable[[], bool]] = None,
     ) -> str:
-        return self.transcribe_pcm(
-            self.capture_pc_mic_until_silence(seconds, on_speech_start=on_speech_start)
+        return self.listen_with_streaming_whisper(seconds, on_speech_start=on_speech_start)
+
+    def listen_with_streaming_whisper(
+        self,
+        max_seconds: float = 30.0,
+        on_speech_start: Optional[Callable[[], bool]] = None,
+        block_seconds: float = 0.5,
+        blocks_per_transcription: int = 6,
+    ) -> str:
+        logger.warning(
+            "Listening with callback microphone stream for up to %.1f seconds",
+            max_seconds,
         )
+        block_frames = int(SAMPLE_RATE * block_seconds)
+        deadline = time.monotonic() + max_seconds
+        audio_buffer = []
+        prompt_reset_done = False
+        activity_threshold = self.vad.threshold / 32768.0
+
+        def audio_callback(indata, frames, time_state, status):
+            if status:
+                logger.warning("PC microphone callback status: %s", status)
+            audio_buffer.append(indata.copy())
+
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+            blocksize=block_frames,
+            callback=audio_callback,
+        ):
+            while time.monotonic() < deadline:
+                if len(audio_buffer) < blocks_per_transcription:
+                    time.sleep(0.05)
+                    continue
+
+                full_audio = np.concatenate(audio_buffer, axis=0).flatten()
+                audio_buffer.clear()
+                rms = float(np.sqrt(np.mean(full_audio.astype(np.float32) ** 2)))
+
+                if not prompt_reset_done and on_speech_start and rms >= activity_threshold:
+                    prompt_reset_done = bool(on_speech_start())
+                    if prompt_reset_done:
+                        logger.warning(
+                            "Stopped active prompt after PC microphone activity: rms=%.4f",
+                            rms,
+                        )
+                        continue
+
+                segments, _info = self.whisper.transcribe(full_audio, beam_size=5)
+                text = " ".join(segment.text.strip() for segment in segments).strip()
+                logger.warning("PC mic transcript candidate: %s rms=%.4f", text or "[empty]", rms)
+
+                if text and len(text) > 2 and re.search(r"[A-Za-z0-9]", text):
+                    return text
+
+        logger.warning("PC microphone listener timed out without recognized speech")
+        return ""
 
 
 class UtteranceBuffer:
