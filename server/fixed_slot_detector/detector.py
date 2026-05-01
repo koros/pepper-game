@@ -315,21 +315,20 @@ class PepperCupDetector:
     def annotate_roi(self, roi_bgr: np.ndarray, detections: List[CupDetection], divider_y: int) -> np.ndarray:
         out = roi_bgr.copy()
         row_masks = self.build_row_band_masks(roi_bgr.shape, divider_y)
-        cv2.line(out, (0, divider_y), (out.shape[1] - 1, divider_y), (255, 0, 0), 3)
 
-        for row_name, color in [("upper", (0, 255, 0)), ("lower", (0, 180, 255))]:
+        for row_name, color in [("upper", (80, 230, 120)), ("lower", (80, 230, 120))]:
             mask = row_masks[row_name]
             ys, xs = np.where(mask > 0)
             if len(xs) > 0 and len(ys) > 0:
-                cv2.rectangle(out, (int(xs.min()), int(ys.min())), (int(xs.max()), int(ys.max())), color, 2)
+                cv2.rectangle(out, (int(xs.min()), int(ys.min())), (int(xs.max()), int(ys.max())), color, 1)
 
         for d in detections:
             x, y, w, h = d.bbox
-            draw_color = DRAW_COLORS[d.color]
-            cv2.rectangle(out, (x, y), (x + w, y + h), draw_color, 3)
-            cv2.circle(out, (int(d.cx), int(d.cy)), 6, draw_color, -1)
-            label = f"{d.color} | {d.row} | score={d.score:.0f}"
-            cv2.putText(out, label, (x, max(25, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_color, 2, cv2.LINE_AA)
+            draw_color = tuple(int(channel) for channel in DRAW_COLORS[d.color])
+            cv2.rectangle(out, (x, y), (x + w, y + h), draw_color, 2)
+            cv2.circle(out, (int(d.cx), int(d.cy)), 4, draw_color, -1)
+            label = f"{d.row[:1].upper()} {d.color}"
+            self.draw_soft_label(out, label, (x, max(18, y - 8)), text_color=(130, 255, 150))
 
         upper_seq = self.row_sequence(detections, "upper")
         lower_seq = self.row_sequence(detections, "lower")
@@ -339,7 +338,32 @@ class PepperCupDetector:
             and len(lower_seq) == self.config.expected_cups_per_row
         )
 
-        cv2.putText(out, f"Upper: {upper_seq}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(out, f"Lower: {lower_seq}", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(out, f"Match: {match}", (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+        self.draw_soft_label(out, f"top: {', '.join(upper_seq) or '?'}", (14, 22), text_color=(140, 255, 160))
+        self.draw_soft_label(out, f"bottom: {', '.join(lower_seq) or '?'}", (14, 46), text_color=(140, 255, 160))
+        self.draw_soft_label(out, f"match: {match}", (14, 70), text_color=(140, 255, 160))
         return out
+
+    @staticmethod
+    def draw_soft_label(
+        frame: np.ndarray,
+        text: str,
+        origin: Tuple[int, int],
+        text_color: Tuple[int, int, int] = (140, 255, 160),
+    ) -> None:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+        thickness = 1
+        padding = 4
+        x, y = origin
+        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        left = max(0, x - padding)
+        top = max(0, y - text_h - padding)
+        right = min(frame.shape[1], x + text_w + padding)
+        bottom = min(frame.shape[0], y + baseline + padding)
+        if right > left and bottom > top:
+            roi = frame[top:bottom, left:right]
+            backing = np.zeros(roi.shape, dtype=np.uint8)
+            cv2.addWeighted(backing, 0.35, roi, 0.65, 0, roi)
+        shadow = (min(frame.shape[1] - 1, x + 1), min(frame.shape[0] - 1, y + 1))
+        cv2.putText(frame, text, shadow, font, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+        cv2.putText(frame, text, origin, font, font_scale, text_color, thickness, cv2.LINE_AA)

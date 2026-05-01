@@ -30,6 +30,10 @@ DETECTOR_COLOR_MAP = {
     "pink": "purple",
     "mint": "green",
 }
+PEPPER_CAMERA_INDEX = 0
+PEPPER_CAMERA_RESOLUTION_CODE = 2
+PEPPER_CAMERA_FPS = 5
+PEPPER_CAMERA_COLOR_SPACE = 11
 
 
 class VisionService:
@@ -145,12 +149,12 @@ class VisionService:
         display_frame = result["annotated_frame"]
         self.draw_text_overlay(
             display_frame,
-            "%s %sx%s | Press s to save current frame" % (source, width, height),
+            self.preview_header_text(source, width, height),
             (12, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            thickness=2,
+            0.48,
+            (140, 255, 160),
+            thickness=1,
         )
         self.show_and_handle_keys(display_frame)
         return {
@@ -316,30 +320,28 @@ class VisionService:
         source: str = "camera",
     ) -> np.ndarray:
         display_frame = frame.copy()
-        if split_y is not None:
-            cv2.line(display_frame, (0, split_y), (display_frame.shape[1], split_y), (255, 255, 255), 1)
         for index, cup in enumerate(cups, start=1):
             x, y, w, h = cup["box"]
             color = str(cup["color"])
             row = str(cup.get("row", "row"))
-            cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), (80, 230, 120), 1)
             self.draw_text_overlay(
                 display_frame,
                 "%s %s %s" % (row, index, color),
                 (x, max(20, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 0),
-                thickness=2,
+                0.42,
+                (130, 255, 150),
+                thickness=1,
             )
         self.draw_text_overlay(
             display_frame,
-            "%s %sx%s | Press s to save current frame" % (source, frame.shape[1], frame.shape[0]),
+            self.preview_header_text(source, frame.shape[1], frame.shape[0]),
             (12, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            thickness=2,
+            0.48,
+            (140, 255, 160),
+            thickness=1,
         )
         return display_frame
 
@@ -352,9 +354,9 @@ class VisionService:
         font_scale: float,
         text_color: tuple,
         thickness: int = 2,
-        padding: int = 6,
+        padding: int = 5,
         background_color: tuple = (0, 0, 0),
-        background_alpha: float = 0.72,
+        background_alpha: float = 0.38,
     ) -> None:
         x, y = origin
         text_size, baseline = cv2.getTextSize(text, font_face, font_scale, thickness)
@@ -371,8 +373,8 @@ class VisionService:
             cv2.addWeighted(backing, background_alpha, roi, 1.0 - background_alpha, 0, roi)
 
         shadow_origin = (min(frame.shape[1] - 1, x + 1), min(frame.shape[0] - 1, y + 1))
-        cv2.putText(frame, text, shadow_origin, font_face, font_scale, (0, 0, 0), thickness + 1)
-        cv2.putText(frame, text, origin, font_face, font_scale, text_color, thickness)
+        cv2.putText(frame, text, shadow_origin, font_face, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+        cv2.putText(frame, text, origin, font_face, font_scale, text_color, thickness, cv2.LINE_AA)
 
     def show_and_handle_keys(self, frame: np.ndarray) -> None:
         with self.preview_lock:
@@ -432,23 +434,32 @@ class VisionService:
 
     def draw_preview_frame(self, frame: np.ndarray, source: str = "camera") -> np.ndarray:
         display_frame = frame.copy()
-        cv2.line(
-            display_frame,
-            (0, display_frame.shape[0] // 2),
-            (display_frame.shape[1], display_frame.shape[0] // 2),
-            (255, 255, 255),
-            1,
-        )
         self.draw_text_overlay(
             display_frame,
-            "%s %sx%s | Press s to save current frame" % (source, frame.shape[1], frame.shape[0]),
+            self.preview_header_text(source, frame.shape[1], frame.shape[0]),
             (12, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            thickness=2,
+            0.48,
+            (140, 255, 160),
+            thickness=1,
         )
         return display_frame
+
+    def preview_header_text(self, source: str, width: int, height: int) -> str:
+        if source.startswith("pepper"):
+            return (
+                "%s %sx%s | cam=%s res=%s fps=%s color=%s | s save"
+                % (
+                    source,
+                    width,
+                    height,
+                    PEPPER_CAMERA_INDEX,
+                    PEPPER_CAMERA_RESOLUTION_CODE,
+                    PEPPER_CAMERA_FPS,
+                    PEPPER_CAMERA_COLOR_SPACE,
+                )
+            )
+        return "%s %sx%s | s save" % (source, width, height)
 
     def save_frame(self, frame: np.ndarray) -> None:
         filename = self.save_dir / ("pepper_cup_frame_%s.jpg" % self.frame_count)

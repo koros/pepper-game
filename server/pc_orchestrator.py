@@ -46,6 +46,7 @@ class CupGameOrchestrator:
         self.pc_mic_capture_seconds = float(flags.get("pc_mic_capture_seconds", 7.0))
         self.pc_audio_barge_in_enabled = bool(flags.get("pc_audio_barge_in_enabled", True))
         self.rearrange_pause_seconds = float(flags.get("rearrange_pause_seconds", 8.0))
+        self.pc_audio_fallback_active = False
 
         logger.info("Initializing cup game orchestrator")
         logger.info("Host bind address: %s", host)
@@ -214,6 +215,9 @@ class CupGameOrchestrator:
             self.send_result("unknown_event", "Unknown command: %s" % event)
 
     def handle_audio_utterance(self, pcm: bytes) -> None:
+        if self.pc_audio_fallback_active:
+            logger.info("Ignoring Pepper audio because PC audio fallback is active")
+            return
         if self.flags["audio_input_mode"] != "pepper":
             logger.info("Ignoring Pepper audio because audio_input_mode=%s", self.flags["audio_input_mode"])
             return
@@ -227,13 +231,12 @@ class CupGameOrchestrator:
             self.say("I did not catch that. Please say the cup colors from left to right, or say help.")
 
     def handle_pc_audio_turn(self, capture_seconds: Optional[float] = None) -> None:
-        if self.flags["audio_input_mode"] != "pc":
-            logger.warning("PC audio requested while audio_input_mode=%s", self.flags["audio_input_mode"])
-            self.send_result(
-                "mode_ignored",
-                "PC audio was requested, but audio_input_mode is not pc.",
+        if self.flags["audio_input_mode"] != "pc" and not self.pc_audio_fallback_active:
+            self.pc_audio_fallback_active = True
+            logger.warning(
+                "PC audio requested while audio_input_mode=%s; enabling PC audio fallback",
+                self.flags["audio_input_mode"],
             )
-            return
         logger.info("Starting PC microphone capture turn")
         if self.pc_audio_barge_in_enabled:
             # Start recording immediately so a user can answer while the prompt is still playing.
@@ -384,7 +387,7 @@ class CupGameOrchestrator:
             event="play_again_prompt",
             listen=listen,
         )
-        if listen and self.flags["audio_input_mode"] == "pc":
+        if listen and self.uses_pc_audio_input():
             self.handle_pc_audio_turn()
 
     def handle_replay_response(self, text: str) -> None:
@@ -405,7 +408,7 @@ class CupGameOrchestrator:
             return
         logger.info("Replay response unclear: %s", text)
         self.prompt_for_replay(
-            listen=(self.flags["audio_input_mode"] == "pc"),
+            listen=self.uses_pc_audio_input(),
             prefix="Please say yes to play again, or no to finish. ",
         )
 
@@ -415,7 +418,7 @@ class CupGameOrchestrator:
         prefix: str = "",
         pause_before_listen: bool = False,
     ) -> None:
-        if self.flags["audio_input_mode"] == "pc" and not self.game.finished:
+        if self.uses_pc_audio_input() and not self.game.finished:
             logger.info("Ready for user control word: ready, check, or help")
             prompt = self.control_prompt_text(pause_before_listen=pause_before_listen)
             self.say_listening_prompt("%s%s" % (prefix, prompt), listen=listen)
@@ -443,6 +446,9 @@ class CupGameOrchestrator:
 
     def uses_voice_sequence_input(self) -> bool:
         return str(self.flags.get("player_input_mode", "")).lower() == "speech"
+
+    def uses_pc_audio_input(self) -> bool:
+        return str(self.flags.get("audio_input_mode", "")).lower() == "pc" or self.pc_audio_fallback_active
 
     def should_speak_listening_prompt(self) -> bool:
         return not (self.pc_audio_barge_in_enabled and self.speech.is_busy())

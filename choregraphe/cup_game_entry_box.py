@@ -12,9 +12,9 @@ VISION_PORT = 50012
 RESULT_PORT = 50013
 
 # Manual user flags. Change these before running the Choregraphe behavior.
-AUDIO_INPUT_MODE = "pc"   # "pepper" or "pc"
-VISION_INPUT_MODE = "pc"  # "pepper" or "pc"
-SPEECH_OUTPUT_MODE = "pc" # "pepper" or "pc"
+AUDIO_INPUT_MODE = "pepper"   # "pepper" or "pc"
+VISION_INPUT_MODE = "pepper"  # "pepper" or "pc"
+SPEECH_OUTPUT_MODE = "pepper" # "pepper" or "pc"
 PLAYER_INPUT_MODE = "vision"  # "vision" or "speech"
 
 PEPPER_VISION_STREAM_ENABLED = True
@@ -49,6 +49,8 @@ class MyClass(GeneratedClass):
 
         self.bIsRunning = False
         self.speech_ids = []
+        self.active_audio_input_mode = AUDIO_INPUT_MODE
+        self.active_audio_subscriber_name = None
 
         self.awareness_was_enabled = None
         self.vision_motion_paused = False
@@ -129,6 +131,8 @@ class MyClass(GeneratedClass):
 
     def onInput_onStart(self):
         self.bIsRunning = True
+        self.active_audio_input_mode = AUDIO_INPUT_MODE
+        self.active_audio_subscriber_name = None
         self.logger.info("Cup game entry starting.")
 
         try:
@@ -160,6 +164,8 @@ class MyClass(GeneratedClass):
         # PLAYER_INPUT_MODE chooses the game input surface. Vision can still preview in the background.
         if PLAYER_INPUT_MODE == "vision":
             self.start_vision_input()
+            if self.active_audio_input_mode == "pepper":
+                self.start_pepper_audio_stream()
         elif PLAYER_INPUT_MODE == "speech":
             self.start_speech_input()
         else:
@@ -184,12 +190,12 @@ class MyClass(GeneratedClass):
         self.capture_and_send_pepper_frame()
 
     def start_speech_input(self):
-        if AUDIO_INPUT_MODE == "pc":
+        if self.active_audio_input_mode == "pc":
             self.request_pc_audio_turn()
-        elif AUDIO_INPUT_MODE == "pepper":
+        elif self.active_audio_input_mode == "pepper":
             self.start_pepper_audio_stream()
         else:
-            self.logger.error("Invalid AUDIO_INPUT_MODE: " + str(AUDIO_INPUT_MODE))
+            self.logger.error("Invalid AUDIO_INPUT_MODE: " + str(self.active_audio_input_mode))
 
     def request_pc_audio_turn(self):
         self.logger.info("Audio delegated to PC by manual flag.")
@@ -199,16 +205,30 @@ class MyClass(GeneratedClass):
         self.logger.info("Audio handled by Pepper microphone by manual flag.")
         if not PEPPER_AUDIO_STREAM_ENABLED:
             self.logger.warning(
-                "Pepper microphone streaming is disabled; game stays open for vision preview and PC results."
+                "Pepper microphone streaming is disabled; falling back to PC microphone."
             )
+            self.fallback_to_pc_audio()
             return
 
-        if self.subscribe_audio():
+        try:
             self.connect_audio_socket()
-        else:
+        except Exception as e:
+            self.logger.warning("Could not connect Pepper audio socket; falling back to PC microphone: " + str(e))
+            self.fallback_to_pc_audio()
+            return
+
+        if not self.subscribe_audio():
             self.logger.warning(
-                "Pepper microphone input is unavailable; game stays open for vision preview and PC results."
+                "Pepper microphone input is unavailable; falling back to PC microphone."
             )
+            self.fallback_to_pc_audio()
+
+    def fallback_to_pc_audio(self):
+        self.active_audio_input_mode = "pc"
+        self.unsubscribe_audio()
+        self.close_socket(self.audio_socket)
+        self.audio_socket = None
+        self.request_pc_audio_turn()
 
     def connect_command_socket(self):
         self.logger.info("Connecting command socket to " + str(PC_IP) + ":" + str(COMMAND_PORT))
@@ -320,7 +340,7 @@ class MyClass(GeneratedClass):
 
         audio_was_subscribed = self.audio_subscribed
 
-        if AUDIO_INPUT_MODE == "pepper" and audio_was_subscribed:
+        if self.is_pepper_audio_active() and audio_was_subscribed:
             self.unsubscribe_audio()
 
         speech_id = self.tts.post.say(text)
@@ -334,7 +354,7 @@ class MyClass(GeneratedClass):
         except Exception:
             pass
 
-        if AUDIO_INPUT_MODE == "pepper" and self.bIsRunning and audio_was_subscribed:
+        if self.is_pepper_audio_active() and self.bIsRunning and audio_was_subscribed:
             self.subscribe_audio()
 
     def subscribe_audio(self):
@@ -342,23 +362,30 @@ class MyClass(GeneratedClass):
             self.logger.error("AUDIO_INPUT_MODE is pepper, but ALAudioDevice is unavailable.")
             return False
 
-        subscriber_name = self.audio_subscriber_name()
+        for subscriber_name in self.audio_subscriber_name_candidates():
+            try:
+                self.logger.info("Trying Pepper microphone subscriber name=%s." % subscriber_name)
+                self.audio.setClientPreferences(subscriber_name, 16000, 3, 0)
+                self.audio.subscribe(subscriber_name)
+                self.audio_subscribed = True
+                self.active_audio_subscriber_name = subscriber_name
+                self.logger.info(
+                    "Pepper microphone streaming started with subscriber name=%s."
+                    % subscriber_name
+                )
+                return True
+            except Exception as e:
+                self.audio_subscribed = False
+                self.active_audio_subscriber_name = None
+                self.logger.warning(
+                    "Pepper microphone subscriber name=%s failed: %s"
+                    % (subscriber_name, str(e))
+                )
 
-        try:
-            self.audio.setClientPreferences(subscriber_name, 16000, 3, 0)
-            self.audio.subscribe(subscriber_name)
-            self.audio_subscribed = True
-            self.logger.info(
-                "Pepper microphone streaming started with subscriber name=%s."
-                % subscriber_name
-            )
-            return True
-        except Exception as e:
-            self.audio_subscribed = False
-            self.logger.error("Pepper microphone streaming could not start: " + str(e))
-            self.close_socket(self.audio_socket)
-            self.audio_socket = None
-            return False
+        self.logger.error("Pepper microphone streaming could not start with any subscriber name.")
+        self.close_socket(self.audio_socket)
+        self.audio_socket = None
+        return False
 
     def unsubscribe_audio(self):
         if self.audio and self.audio_subscribed:
@@ -372,9 +399,33 @@ class MyClass(GeneratedClass):
             except Exception as e:
                 self.logger.warning("Pepper microphone unsubscribe failed: " + str(e))
             self.audio_subscribed = False
+            self.active_audio_subscriber_name = None
 
     def audio_subscriber_name(self):
-        return str(AUDIO_SUBSCRIBER_NAME)
+        return str(self.active_audio_subscriber_name or AUDIO_SUBSCRIBER_NAME)
+
+    def audio_subscriber_name_candidates(self):
+        names = []
+        self.add_audio_subscriber_candidate(names, AUDIO_SUBSCRIBER_NAME)
+        try:
+            self.add_audio_subscriber_candidate(names, self.getName())
+        except Exception:
+            pass
+        try:
+            name = str(self.getName())
+            self.add_audio_subscriber_candidate(names, name.split("/")[-1])
+            self.add_audio_subscriber_candidate(names, name.split(":")[-1])
+        except Exception:
+            pass
+        return names
+
+    def add_audio_subscriber_candidate(self, names, value):
+        name = str(value).strip()
+        if name and name not in names:
+            names.append(name)
+
+    def is_pepper_audio_active(self):
+        return self.active_audio_input_mode == "pepper"
 
     def capture_and_send_pepper_frame(self):
         if not self.video:
@@ -636,7 +687,7 @@ class MyClass(GeneratedClass):
             self.video_subscriber = None
 
     def processRemote(self, nbOfChannels, nbrOfSamplesByChannel, timestamp, buffer):
-        if not self.bIsRunning or AUDIO_INPUT_MODE != "pepper":
+        if not self.bIsRunning or not self.is_pepper_audio_active():
             return
         if not self.audio_socket:
             return
