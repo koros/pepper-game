@@ -9,6 +9,11 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
 from audio_service import AudioService, UtteranceBuffer
 from cup_game_logic import CupGame
 from lm_studio_client import LMStudioClient
@@ -47,6 +52,7 @@ class CupGameOrchestrator:
         self.pc_audio_barge_in_enabled = bool(flags.get("pc_audio_barge_in_enabled", True))
         self.rearrange_pause_seconds = float(flags.get("rearrange_pause_seconds", 8.0))
         self.pc_audio_fallback_active = False
+        self.keyboard_lock = threading.RLock()
 
         logger.info("Initializing cup game orchestrator")
         logger.info("Host bind address: %s", host)
@@ -226,7 +232,10 @@ class CupGameOrchestrator:
         elif event == "start_round":
             self.start_round()
         elif event == "pc_audio_turn":
-            self.handle_pc_audio_turn()
+            if self.uses_pc_keyboard_input():
+                logger.warning("Ignoring pc_audio_turn because keyboard control mode is active")
+            else:
+                self.handle_pc_audio_turn()
         elif event == "pc_vision_check":
             self.handle_pc_vision_check()
         elif event == "pepper_vision_check":
@@ -409,11 +418,13 @@ class CupGameOrchestrator:
     def prompt_for_replay(self, listen: bool = False, prefix: str = "") -> None:
         self.awaiting_replay_response = True
         self.say_listening_prompt(
-            "%sDo you want to play again? Say yes or no." % prefix,
+            "%sDo you want to play again? Press Y for yes, or N for no." % prefix,
             event="play_again_prompt",
             listen=listen,
         )
-        if listen and self.uses_pc_audio_input():
+        if listen and self.uses_pc_keyboard_input():
+            self.handle_pc_keyboard_turn()
+        elif listen and self.uses_pc_audio_input():
             self.handle_pc_audio_turn()
 
     def handle_replay_response(self, text: str) -> None:
@@ -434,8 +445,8 @@ class CupGameOrchestrator:
             return
         logger.info("Replay response unclear: %s", text)
         self.prompt_for_replay(
-            listen=self.uses_pc_audio_input(),
-            prefix="Please say yes to play again, or no to finish. ",
+            listen=self.uses_pc_audio_input() or self.uses_pc_keyboard_input(),
+            prefix="Please press Y to play again, or N to finish. ",
         )
 
     def prompt_for_control(
@@ -444,11 +455,14 @@ class CupGameOrchestrator:
         prefix: str = "",
         pause_before_listen: bool = False,
     ) -> None:
-        if self.uses_pc_audio_input() and not self.game.finished:
-            logger.info("Ready for user control word: ready, check, or help")
+        if (self.uses_pc_audio_input() or self.uses_pc_keyboard_input()) and not self.game.finished:
+            logger.info("Ready for user control: c=check h=help")
             prompt = self.control_prompt_text(pause_before_listen=pause_before_listen)
             self.say_listening_prompt("%s%s" % (prefix, prompt), listen=listen)
             if listen:
+                if self.uses_pc_keyboard_input():
+                    self.handle_pc_keyboard_turn()
+                    return
                 capture_seconds = self.pc_mic_capture_seconds
                 if pause_before_listen and self.rearrange_pause_seconds > 0:
                     capture_seconds += self.rearrange_pause_seconds
@@ -460,12 +474,12 @@ class CupGameOrchestrator:
 
     def control_prompt_text(self, pause_before_listen: bool = False) -> str:
         if self.is_dev_speech_sequence_mode():
-            return "Please say the current top row colors from left to right. Say help if you need a clue."
+            return "Please type the current top row colors from left to right, or press H for help."
         if self.uses_vision_sequence_input():
             if pause_before_listen:
-                return "Take a moment to rearrange the cups. When you are ready, say ready or check. Say help if you need a clue."
-            return "Say ready or check when you want me to evaluate the top row. Say help if you need a clue."
-        return "Say ready or check when you want me to evaluate the top row. Say help if you need a clue."
+                return "Take a moment to rearrange the cups. Press C when you want me to check. Press H if you need help."
+            return "Press C when you want me to check the top row. Press H if you need help."
+        return "Press C when you want me to check the top row. Press H if you need help."
 
     def is_dev_speech_sequence_mode(self) -> bool:
         return bool(self.flags.get("dev_speech_sequence_mode", False))
@@ -475,6 +489,47 @@ class CupGameOrchestrator:
 
     def uses_pc_audio_input(self) -> bool:
         return str(self.flags.get("audio_input_mode", "")).lower() == "pc" or self.pc_audio_fallback_active
+
+    def uses_pc_keyboard_input(self) -> bool:
+        return str(self.flags.get("pc_control_input_mode", "speech")).lower() == "keyboard"
+
+    def handle_pc_keyboard_turn(self) -> None:
+        with self.keyboard_lock:
+            if self.awaiting_replay_response:
+                logger.warning("Waiting for keyboard replay input: y=yes n=no")
+                key = self.read_pc_key("Play again? Press Y for yes, or N for no: ")
+                if key == "y":
+                    self.handle_replay_response("yes")
+                elif key == "n":
+                    self.handle_replay_response("no")
+                else:
+                    logger.warning("Ignored keyboard input for replay: %s", key)
+                    self.prompt_for_replay(listen=True, prefix="I did not understand that key. ")
+                return
+
+            logger.warning("Waiting for keyboard input: c=check h=help")
+            if self.is_dev_speech_sequence_mode():
+                text = input("Type colors left to right, or H for help: ").strip()
+                logger.warning("Keyboard input received: %s", text)
+                self.handle_spoken_input("help" if text.lower() == "h" else text)
+                return
+
+            key = self.read_pc_key("Press C to check, or H for help: ")
+            if key == "c":
+                self.handle_spoken_input("check")
+            elif key == "h":
+                self.handle_spoken_input("help")
+            else:
+                logger.warning("Ignored keyboard input for control: %s", key)
+                self.prompt_for_control(listen=True, prefix="I did not understand that key. ")
+
+    def read_pc_key(self, prompt: str) -> str:
+        print(prompt, end="", flush=True)
+        if msvcrt is not None:
+            key = msvcrt.getwch()
+            print(key)
+            return key.lower()
+        return input().strip().lower()[:1]
 
     def should_speak_listening_prompt(self) -> bool:
         return not (self.pc_audio_barge_in_enabled and self.speech.is_busy())

@@ -19,6 +19,7 @@
   "pc_speech_enabled": true,
   "pc_speech_rate": 0,
   "pc_speech_volume": 80,
+  "pc_control_input_mode": "keyboard",
   "pc_mic_capture_seconds": 30.0,
   "rearrange_pause_seconds": 12.0,
   "pc_audio_barge_in_enabled": true,
