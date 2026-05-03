@@ -23,15 +23,12 @@ pepper_cup_game_choregraphe/
 |   |-- audio_service.py
 |   |-- vision_service.py
 |   |-- cup_game_logic.py
-|   `-- lm_studio_client.py
+|   |-- lm_studio_client.py
+|   `-- fixed_slot_detector/
 |-- choregraphe/
-|   |-- cup_game_entry_box.py
-|   |-- audio_stream_box.py
-|   |-- vision_capture_box.py
-|   |-- speech_box.py
-|   `-- config_box.py
+|   `-- cup_game_entry_box.py
 `-- robot/
-    `-- shared_socket_protocol.py
+    `-- pepper_pomdp.py
 ```
 
 ## Socket Ports
@@ -45,29 +42,28 @@ Configured in `config/ports.json`.
 50013 PC result text to Pepper
 ```
 
-## Manual Delegation Flags
+## Runtime Modes
 
-The user controls delegation manually. Pepper does not switch modes by itself during the game.
+The user controls delegation manually. Pepper does not switch modes by itself during the game. Keep the PC config and Choregraphe flags aligned before running.
 
 PC-side defaults live in `config/runtime_flags.json`:
 
 ```json
 {
-  "audio_input_mode": "pepper",
-  "vision_input_mode": "pepper",
-  "speech_output_mode": "pepper"
+  "audio_input_mode": "pc",
+  "vision_input_mode": "pc",
+  "speech_output_mode": "pc"
 }
 ```
 
-Choregraphe scripts also have matching flags at the top:
+The Choregraphe Python box has matching flags near the top:
 
 ```python
-AUDIO_INPUT_MODE = "pepper"   # "pepper" or "pc"
-VISION_INPUT_MODE = "pepper"  # "pepper" or "pc"
-SPEECH_OUTPUT_MODE = "pepper" # "pepper" or "pc"
+AUDIO_INPUT_MODE = "pc"       # "pepper" or "pc"
+VISION_INPUT_MODE = "pc"      # "pepper" or "pc"
+SPEECH_OUTPUT_MODE = "pc"     # "pepper" or "pc"
+PLAYER_INPUT_MODE = "vision"  # "vision" or "speech"
 ```
-
-Keep the PC config and Choregraphe flags aligned before running.
 
 ## Audio Detection On Windows
 
@@ -104,9 +100,9 @@ If it misses quiet speech, decrease `energy_vad_threshold`.
 - `SPEECH_OUTPUT_MODE = "pepper"`: PC sends response text to Pepper on port `50013`, and Pepper speaks it.
 - `SPEECH_OUTPUT_MODE = "pc"`: PC prints the response locally for emulator/testing flows.
 
-## PC Setup
+## PC Server Setup
 
-Install Python 3.8 to 3.11, then run:
+Install Python 3.8 to 3.11, then set up the project:
 
 ```bash
 cd pepper_cup_game_choregraphe
@@ -127,40 +123,145 @@ Start the PC server:
 python server/pc_orchestrator.py
 ```
 
-The server prints the PC IP address to use in Choregraphe.
+Keep this server running before you start the Choregraphe behavior.
 
 ## Choregraphe Setup
 
-Paste `choregraphe/cup_game_entry_box.py` into a Choregraphe Python box.
+Use these steps for both PC mode and Pepper mode.
 
-At the top of the script, set:
+1. Open Choregraphe.
+2. Connect Choregraphe to the target:
+   - For PC mode, connect to a virtual robot.
+   - For Pepper mode, connect to the actual Pepper robot.
+3. Create a new behavior or open your behavior project.
+4. Drag a new Python Script box into the behavior workspace.
+5. Double-click the Python box to edit it.
+6. Copy all code from `choregraphe/cup_game_entry_box.py`. On this machine, the full path is `C:\Users\koros\OneDrive\Desktop\Workspace\pepper_cup_game_choregraphe\choregraphe\cup_game_entry_box.py`.
+7. Paste that code into the Choregraphe Python Script box, replacing the template code.
+8. Rename the box if desired. The screenshot uses `Game`.
+9. Wire the box as shown in the screenshot:
+   - Connect the root input on the left to the Python box input.
+   - Connect the Python box output to the root output on the right.
+10. Update the settings at the top of the Python script.
+11. Make the matching changes in `config/runtime_flags.json` on the PC.
+12. Start the PC server, then press Play in Choregraphe.
+
+### PC Mode With A Virtual Robot
+
+Use this mode for local testing. Choregraphe is connected to a virtual robot, and the PC handles microphone input, camera input, and speech output.
+
+In `choregraphe/cup_game_entry_box.py`, use:
 
 ```python
-PC_IP = "YOUR_PC_IP"
+PC_IP = "127.0.0.1"
+AUDIO_INPUT_MODE = "pc"
+VISION_INPUT_MODE = "pc"
+SPEECH_OUTPUT_MODE = "pc"
+PLAYER_INPUT_MODE = "vision"
+```
+
+In `config/runtime_flags.json`, use:
+
+```json
+{
+  "audio_input_mode": "pc",
+  "vision_input_mode": "pc",
+  "speech_output_mode": "pc",
+  "player_input_mode": "vision",
+  "vision_preview_enabled": true,
+  "vision_live_preview_enabled": true
+}
+```
+
+Run the PC server:
+
+```bash
+python server/pc_orchestrator.py
+```
+
+Then run the behavior in Choregraphe.
+
+### Pepper Mode With A Real Robot
+
+Use this mode when Choregraphe is connected to an actual Pepper robot. Pepper can provide microphone input, camera input, and spoken output, while the PC still runs the game server and AI services.
+
+In the Choregraphe Python box, update `PC_IP` to the PC address Pepper can reach, then use:
+
+```python
+PC_IP = "YOUR_PC_IPV4_ADDRESS"
 AUDIO_INPUT_MODE = "pepper"
 VISION_INPUT_MODE = "pepper"
 SPEECH_OUTPUT_MODE = "pepper"
-PLAYER_INPUT_MODE = "speech"
+PLAYER_INPUT_MODE = "vision"
 ```
 
-Run the box. Pepper will:
+In `config/runtime_flags.json`, use:
+
+```json
+{
+  "audio_input_mode": "pepper",
+  "vision_input_mode": "pepper",
+  "speech_output_mode": "pepper",
+  "player_input_mode": "vision",
+  "vision_preview_enabled": true
+}
+```
+
+Run the PC server, then upload and run the behavior from Choregraphe.
+
+## Finding The PC IP Address
+
+`PC_IP` must be the IPv4 address of the PC running `server/pc_orchestrator.py`.
+
+For PC mode with a virtual robot on the same machine, use:
+
+```python
+PC_IP = "127.0.0.1"
+```
+
+For Pepper mode with a real robot, use the PC network interface connected to Pepper. A direct Ethernet connection to Pepper often uses an automatic private address in this range:
+
+```text
+169.254.x.x
+```
+
+On Windows, open Command Prompt or PowerShell and run:
+
+```powershell
+ipconfig
+```
+
+Look for the Ethernet adapter connected to Pepper, then copy its `IPv4 Address`. It should usually start with `169.254.` for the direct Pepper Ethernet link.
+
+On macOS or Linux, run:
+
+```bash
+ifconfig
+```
+
+or:
+
+```bash
+ip addr
+```
+
+Use the matching IPv4 address that starts with `169.254.`. For example:
+
+```python
+PC_IP = "169.254.103.203"
+```
+
+Make sure Windows Firewall allows Python to accept incoming connections, or Pepper may fail to connect to the PC server.
+
+## Running The Game
+
+After the PC server is running and the Choregraphe box is wired:
 
 1. Connect to the PC server.
 2. Start a color-sequence game.
-3. Listen for the user to say `ready`, `check`, or `hint`.
-4. Capture both cup rows with vision when the user says `ready` or `check`.
+3. Listen for the user to say or press `check` or `hint`, depending on the configured input mode.
+4. Capture both cup rows with vision when the user asks for a check.
 5. Speak or log the result based on `SPEECH_OUTPUT_MODE`.
-
-## Optional Modular Boxes
-
-The files below are provided if you prefer wiring separate Choregraphe boxes:
-
-- `audio_stream_box.py`
-- `vision_capture_box.py`
-- `speech_box.py`
-- `config_box.py`
-
-For the simplest workflow, start with `cup_game_entry_box.py`.
 
 ## Cup Game Logic
 
@@ -185,9 +286,9 @@ Example config:
 }
 ```
 
-Vision currently splits the frame into upper and lower horizontal bands, then uses OpenCV HSV color masks to extract `top_row` and `bottom_row` sequences. You can tune `server/vision_service.py` for your actual cup colors, lighting, camera angle, and table setup.
+Vision uses the fixed-slot detector in `server/fixed_slot_detector/` to extract `top_row` and `bottom_row` sequences. Tune that detector for your actual cup colors, lighting, camera angle, and table setup.
 
-## Vision Preview And Saving Frames
+## Vision Preview
 
 The PC vision service can show the latest processed frame in an OpenCV window, like the original template.
 
@@ -196,14 +297,8 @@ Configure it in `config/runtime_flags.json`:
 ```json
 {
   "vision_preview_enabled": true,
-  "vision_save_dir": "captured_frames",
   "vision_window_name": "Pepper Cup Game Vision"
 }
 ```
 
-When the preview window is focused:
-
-- Press `s` to save the currently displayed frame.
-- Press `q` to close the preview window for the current server run.
-
-Saved frames are written under `captured_frames/` in this project.
+When the preview window is focused, press `q` to close it for the current server run.

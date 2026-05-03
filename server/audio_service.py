@@ -100,7 +100,7 @@ class AudioService:
             if text and not re.search(r"[A-Za-z0-9]", text):
                 logger.warning("Discarding punctuation-only transcription: %s", text)
                 text = ""
-            logger.warning("Whisper transcription from microphone: %s", text or "[empty]")
+            logger.info("Whisper transcription from microphone: %s", text or "[empty]")
             return text
         finally:
             try:
@@ -109,80 +109,6 @@ class AudioService:
             except OSError:
                 logger.warning("Could not remove temporary WAV: %s", wav_path)
                 pass
-
-    def capture_pc_mic(self, seconds: float = 7.0) -> bytes:
-        logger.warning("Capturing PC microphone audio for %.1f seconds", seconds)
-        frames = int(seconds * SAMPLE_RATE)
-        audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1, dtype="int16")
-        sd.wait()
-        logger.warning("PC microphone capture complete: %s bytes", audio.nbytes)
-        return audio.tobytes()
-
-    def capture_pc_mic_until_silence(
-        self,
-        max_seconds: float = 7.0,
-        on_speech_start: Optional[Callable[[], bool]] = None,
-        reset_after_callback_seconds: float = 0.35,
-        reset_extra_seconds: float = 4.0,
-    ) -> bytes:
-        logger.warning("Streaming PC microphone audio for up to %.1f seconds", max_seconds)
-        block_frames = int(SAMPLE_RATE * FRAME_MS / 1000)
-        deadline = time.monotonic() + max_seconds
-        captured = bytearray()
-        active = False
-        speech_frames = 0
-        silence_frames = 0
-        ignore_until = 0.0
-
-        with sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=block_frames,
-        ) as stream:
-            while time.monotonic() < deadline:
-                frame, overflowed = stream.read(block_frames)
-                if overflowed:
-                    logger.warning("PC microphone input overflowed while listening")
-
-                frame_bytes = bytes(frame)
-                if time.monotonic() < ignore_until:
-                    continue
-
-                captured.extend(frame_bytes)
-                is_speech = self.vad.is_speech(frame_bytes)
-
-                if is_speech:
-                    speech_frames += 1
-                    silence_frames = 0
-                else:
-                    silence_frames += 1
-
-                if not active and speech_frames >= self.min_speech_frames:
-                    active = True
-                    logger.warning("Speech start detected in PC microphone stream")
-                    if on_speech_start and on_speech_start():
-                        logger.warning("Resetting PC microphone capture after stopping prompt echo")
-                        captured = bytearray()
-                        active = False
-                        speech_frames = 0
-                        silence_frames = 0
-                        ignore_until = time.monotonic() + reset_after_callback_seconds
-                        deadline = max(deadline, time.monotonic() + reset_extra_seconds)
-                        continue
-
-                if active and silence_frames >= self.end_silence_frames:
-                    logger.warning(
-                        "Speech end detected in PC microphone stream after %s bytes",
-                        len(captured),
-                    )
-                    break
-
-                if not active and not is_speech:
-                    speech_frames = 0
-
-        logger.warning("PC microphone streaming capture complete: %s bytes", len(captured))
-        return bytes(captured)
 
     def capture_and_transcribe_pc_mic(
         self,
@@ -200,11 +126,10 @@ class AudioService:
         block_seconds: float = 0.5,
         blocks_per_transcription: int = 6,
     ) -> str:
-        logger.warning(
+        logger.info(
             "Listening with callback microphone stream for up to %.1f seconds",
             max_seconds,
         )
-        logger.warning("PC microphone will log every transcript candidate it hears")
         block_frames = int(SAMPLE_RATE * block_seconds)
         deadline = time.monotonic() + max_seconds
         audio_buffer = []
@@ -224,11 +149,9 @@ class AudioService:
                 if len(rolling_audio) > max_rolling_blocks:
                     del rolling_audio[: len(rolling_audio) - max_rolling_blocks]
 
-        def transcribe_array(audio: np.ndarray, label: str, rms: float) -> str:
+        def transcribe_array(audio: np.ndarray) -> str:
             segments, _info = self.whisper.transcribe(audio, beam_size=5)
-            text = " ".join(segment.text.strip() for segment in segments).strip()
-            logger.warning("PC mic transcript candidate (%s): %s rms=%.4f", label, text or "[empty]", rms)
-            return text
+            return " ".join(segment.text.strip() for segment in segments).strip()
 
         def accepted_text(text: str) -> bool:
             return bool(
@@ -249,7 +172,7 @@ class AudioService:
                 if poll_key:
                     key_text = poll_key()
                     if key_text:
-                        logger.warning("PC keyboard override received while listening: %s", key_text)
+                        logger.info("PC keyboard override received while listening: %s", key_text)
                         return key_text
 
                 with buffer_lock:
@@ -270,7 +193,7 @@ class AudioService:
                 if not prompt_reset_done and on_speech_start and rms >= activity_threshold:
                     prompt_reset_done = bool(on_speech_start())
                     if prompt_reset_done:
-                        logger.warning(
+                        logger.info(
                             "Stopped active prompt after PC microphone activity: rms=%.4f",
                             rms,
                         )
@@ -279,26 +202,25 @@ class AudioService:
                             rolling_audio.clear()
                         continue
 
-                text = transcribe_array(recent_audio, "recent", rms)
+                text = transcribe_array(recent_audio)
                 if accepted_text(text):
                     return text
                 if text and text != last_transcript:
                     last_transcript = text
-                    logger.warning("PC mic transcript logged but not accepted as current input: %s", text)
+                    logger.debug("PC mic transcript was not accepted as current input: %s", text)
 
                 if len(rolling_blocks) > blocks_per_transcription:
-                    rolling_rms = float(np.sqrt(np.mean(rolling_full_audio.astype(np.float32) ** 2)))
-                    rolling_text = transcribe_array(rolling_full_audio, "rolling", rolling_rms)
+                    rolling_text = transcribe_array(rolling_full_audio)
                     if accepted_text(rolling_text):
                         return rolling_text
                     if rolling_text and rolling_text != last_transcript:
                         last_transcript = rolling_text
-                        logger.warning(
-                            "PC mic rolling transcript logged but not accepted as current input: %s",
+                        logger.debug(
+                            "PC mic rolling transcript was not accepted as current input: %s",
                             rolling_text,
                         )
 
-        logger.warning("PC microphone listener timed out without recognized speech")
+        logger.info("PC microphone listener timed out without recognized speech")
         return ""
 
 
