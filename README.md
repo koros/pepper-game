@@ -31,6 +31,61 @@ pepper_cup_game_choregraphe/
     `-- pepper_pomdp.py
 ```
 
+## Architecture Diagram
+
+```mermaid
+flowchart LR
+    subgraph Pepper["Pepper / Choregraphe runtime"]
+        Box["choregraphe/cup_game_entry_box.py<br/>GeneratedClass entry point"]
+        Naoqi["NAOqi services<br/>ALTextToSpeech<br/>ALAudioDevice<br/>ALVideoDevice<br/>ALMotion / ALBasicAwareness"]
+        Box <--> Naoqi
+    end
+
+    subgraph PC["PC Python server"]
+        Orchestrator["server/pc_orchestrator.py<br/>CupGameOrchestrator"]
+        Sockets["server/sockets.py<br/>JSON lines + binary payload helpers"]
+        Game["server/cup_game_logic.py<br/>CupGame rules, attempts, hints"]
+        Vision["server/vision_service.py<br/>OpenCV frame capture + cup detection"]
+        Detector["server/fixed_slot_detector/*<br/>fixed-slot color detector"]
+        Audio["server/audio_service.py<br/>energy VAD + faster-whisper"]
+        Speech["server/speech_service.py<br/>PC TTS fallback"]
+        LLM["server/lm_studio_client.py<br/>Pepper-friendly reply rewrite"]
+        POMDP["robot/pepper_pomdp.py<br/>hint-offer policy"]
+        Config["config/ports.json<br/>config/runtime_flags.json"]
+
+        Orchestrator --> Sockets
+        Orchestrator --> Game
+        Orchestrator --> Vision
+        Vision --> Detector
+        Orchestrator --> Audio
+        Orchestrator --> Speech
+        Orchestrator --> LLM
+        Orchestrator --> POMDP
+        Orchestrator --> Config
+    end
+
+    subgraph External["External devices and services"]
+        PcMic["PC microphone"]
+        PcCam["PC webcam"]
+        PcSpeaker["PC speakers"]
+        LMStudio["LM Studio<br/>http://localhost:1234/v1"]
+    end
+
+    Box -- "50010 command/control<br/>newline JSON events" --> Orchestrator
+    Box -- "50011 Pepper audio stream<br/>length-prefixed PCM" --> Orchestrator
+    Box -- "50012 Pepper camera frames<br/>width/height/size + RGB bytes" --> Orchestrator
+    Orchestrator -- "50013 result text/data<br/>newline JSON events" --> Box
+
+    PcMic --> Audio
+    PcCam --> Vision
+    Speech --> PcSpeaker
+    LLM --> LMStudio
+```
+
+Runtime is coordinated by `CupGameOrchestrator`. Pepper sends control events, optional microphone audio, and optional camera frames over TCP sockets. The PC server handles game state, cup detection, speech transcription, hint policy, and response phrasing, then sends result events back to Pepper or speaks locally depending on `speech_output_mode`.
+
+The `robot/game_manager.py`, `robot/main.py`, and `robot/compvis.py` files are prototype/local-console game flow code. The Choregraphe workflow described above uses `choregraphe/cup_game_entry_box.py` as the robot-side entry point and imports `robot/pepper_pomdp.py` for the hint policy.
+
 ## Socket Ports
 
 Configured in `config/ports.json`.
