@@ -136,7 +136,7 @@ Use these steps for both PC mode and Pepper mode.
 3. Create a new behavior or open your behavior project.
 4. Drag a new Python Script box into the behavior workspace.
 5. Double-click the Python box to edit it.
-6. Copy all code from `choregraphe/cup_game_entry_box.py`. On this machine, the full path is `C:\Users\koros\OneDrive\Desktop\Workspace\pepper_cup_game_choregraphe\choregraphe\cup_game_entry_box.py`.
+6. Copy all code from `choregraphe/cup_game_entry_box.py`.
 7. Paste that code into the Choregraphe Python Script box, replacing the template code.
 8. Rename the box if desired. The screenshot uses `Game`.
 9. Wire the box as shown in the screenshot:
@@ -178,6 +178,9 @@ Run the PC server:
 ```bash
 python server/pc_orchestrator.py
 ```
+
+<img width="1448" height="813" alt="choregraphe" src="https://github.com/user-attachments/assets/ff6356f9-4c0b-440d-9da0-0c3c7f47f687" />
+
 
 Then run the behavior in Choregraphe.
 
