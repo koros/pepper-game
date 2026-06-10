@@ -1,5 +1,22 @@
 # Pepper Cup Game Choregraphe
 
+## 🎥 Project Demonstration
+
+See the Pepper Cup Game in action:
+
+- ▶️ Demo Video 1: https://www.youtube.com/shorts/u27aWdbHrJ0
+- ▶️ Demo Video 2: https://www.youtube.com/shorts/qd69H5TZrEg
+- ▶️ Local Development / PC Simulation Mode: https://www.youtube.com/watch?v=iwYH04tjuYQ
+
+<p align="center">
+  <img
+    src="https://github.com/user-attachments/assets/2e95ffa7-abca-494c-9bb4-ffd9cd1cbb16"
+    alt="IMG_20260501_182657"
+    height="400"
+  />
+</p>
+
+
 This project runs a Pepper cup game with Choregraphe as the robot-side entry point and a Python 3 PC server handling heavier work through sockets.
 
 The project follows the style of the template projects:
